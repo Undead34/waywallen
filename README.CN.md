@@ -6,6 +6,8 @@
 
 <p align="center"><strong> Wallpaper Manager for Linux </strong></p>
 
+<a href="README.md">English README</a>
+
 ---
 
 Waywallen 是一个为 Linux 桌面打造的动态壁纸方案  
@@ -23,8 +25,7 @@ Waywallen 是一个为 Linux 桌面打造的动态壁纸方案
 
 ### 安装
 
-**Flatpak**
-[org.waywallen.waywallen](https://github.com/hypengw/org.waywallen.waywallen)
+**预编译包** —— 到 [Releases 页面](https://github.com/waywallen/waywallen/releases) 下载最新版本。
 
 **从源码构建** —— 见 [BUILD.md](BUILD.md)。
 
@@ -43,5 +44,12 @@ Waywallen 是一个为 Linux 桌面打造的动态壁纸方案
 |------|------|
 | 图片壁纸 | ✅ |
 | 场景壁纸 | ✅ [open-wallpaper-engine](https://github.com/waywallen/open-wallpaper-engine) |
-| 视频壁纸 | ✅ mpv |
-| 网页壁纸 | ⚠️ 规划中 |
+| 视频壁纸 | ✅ |
+| 网页壁纸 | ✅ [open-wallpaper-engine](https://github.com/waywallen/open-wallpaper-engine)|
+
+## 配置
+1. 打开 `System Settings` - `wallpaper`
+2. 修改 `Wallpaper type` 为 `Waywallen`,并确保 `Display module` 为 `Embedded`
+3. 从 `Application Launcher` 启动 `Waywallen` 或直接运行 `waywallen`
+4. 添加 `Source`，默认的 `Wallpaper Engine` 数据文件夹位于 `~/.local/share/Steam/steamapps/workshop/content/431960/`
+5. 现在应当可以使用来自 `Wallpaper Engine` 的动态壁纸了。

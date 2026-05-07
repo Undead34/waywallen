@@ -3,25 +3,25 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
-use media_probe::{AvFormatProbe, MediaProbe};
+use probe::media::{AvFormatProbe, MediaProbe};
 
 mod control;
 mod control_proto;
 mod dbus_iface;
-mod display_endpoint;
-mod display_proto;
-mod display_spawner;
+mod display;
+mod dma;
+mod error;
 mod events;
+mod gpu;
 mod ipc;
-mod media_probe;
 mod model;
-mod negotiate;
-mod playlist;
+mod queue;
 mod plugin;
-mod probe_task;
+mod probe;
 mod renderer_manager;
 mod routing;
 mod scheduler;
+mod self_test;
 mod settings;
 mod sync;
 mod tasks;
@@ -40,12 +40,17 @@ pub struct AppState {
     pub source_snapshot: Arc<tokio::sync::RwLock<plugin::source_snapshot::SourceSnapshot>>,
     pub router: Arc<routing::Router>,
     pub settings: Arc<settings::SettingsStore>,
+    /// Snapshot of `/dev/dri` taken at startup. Read-only after construction;
+    /// surfaced to UI via `GpuListRequest` and used by `RendererManager`
+    /// to translate per-plugin `gpu_drm_dev` settings into `render_node`
+    /// paths injected into Init.settings.
+    pub gpus: Arc<Vec<gpu::GpuInfo>>,
     pub db: sea_orm::DatabaseConnection,
-    pub playlist: tokio::sync::Mutex<control::PlaylistState>,
+    pub queue: tokio::sync::Mutex<control::QueueState>,
     /// Auto-rotation control handle. The rotator task watches the
     /// matching `watch::Receiver` and re-arms its deadline on every
     /// edit (interval change OR a manual `kick`).
-    pub rotation: playlist::RotationHandle,
+    pub rotation: queue::RotationHandle,
     /// Process-wide event bus. Carries phase markers (sources ready,
     /// display ready) the boot coordinator gates on, plus transient
     /// notifications about restore success/failure.
@@ -57,6 +62,11 @@ pub struct AppState {
     /// relying on transient start/end notifications.
     pub scan_in_progress: std::sync::atomic::AtomicBool,
     pub ui_path: std::sync::Mutex<Option<PathBuf>>,
+    /// Live DBus connection. Populated by `dbus_iface::serve` once the
+    /// `Daemon1` interface is published. Used by control:: setters to
+    /// emit `PropertiesChanged` when mutations bypass the DBus method
+    /// path (rotator auto-tick, WS settings updates).
+    pub dbus_conn: std::sync::Mutex<Option<Arc<zbus::Connection>>>,
     /// Daemon-wide shutdown signal. Flips `false` → `true` exactly once.
     /// Every long-lived task (display endpoint, per-client loops, tray,
     /// ws server) should race its work against
@@ -196,6 +206,15 @@ fn resolve_ui_path(explicit: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // `--test` is the user-runnable diagnostic path. Detect it before
+    // any daemon bootstrap (DBus, DB, plugins) so the test never
+    // touches the user's persisted state.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.iter().any(|a| a == "--test") {
+        env_logger::init();
+        return self_test::run(argv);
+    }
+
     env_logger::init();
 
     // Explicit runtime + `shutdown_timeout` safety net: if any
@@ -214,6 +233,16 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main() -> anyhow::Result<()> {
     let cli = parse_args();
+
+    let ui_bin: Option<PathBuf> = if cli.no_ui {
+        None
+    } else {
+        resolve_ui_path(cli.ui_path.clone())
+    };
+
+    // Single-instance gate.
+    let dbus_conn = dbus_iface::acquire_or_handoff(ui_bin.as_deref()).await;
+    log::info!("DBus name acquired: {}", dbus_iface::BUS_NAME);
 
     let mut registry = plugin::renderer_registry::build_default_registry()
         .expect("failed to build renderer registry");
@@ -253,15 +282,67 @@ async fn async_main() -> anyhow::Result<()> {
     renderer_mgr.start_reaper();
     let settings_store =
         settings::SettingsStore::load_or_default(settings::default_config_path()).await;
+    router.attach_settings(settings_store.clone());
+    settings_store.reconcile(renderer_mgr.registry());
+
+    let gpus = Arc::new(gpu::enumerate());
+    renderer_mgr.attach_gpus(gpus.clone());
+    log::info!("gpu::enumerate found {} GPU(s)", gpus.len());
+    for g in gpus.iter() {
+        log::debug!(
+            "  gpu: render={:?} primary={:?} drm={}:{} pci={:?} {} ({:#06x}:{:#06x})",
+            g.render_node,
+            g.primary_node,
+            g.render_major,
+            g.render_minor,
+            g.pci_bdf,
+            g.driver,
+            g.vendor_id,
+            g.device_id,
+        );
+    }
+    {
+        let valid: std::collections::HashSet<(u32, u32)> = gpus
+            .iter()
+            .filter(|g| g.render_node.is_some())
+            .map(|g| (g.render_major, g.render_minor))
+            .collect();
+        settings_store.update(|s| {
+            for (plugin_name, kv) in s.plugins.iter_mut() {
+                let stale = kv.get(gpu::GPU_DRM_DEV_KEY).is_some_and(|v| {
+                    gpu::parse_drm_dev(v)
+                        .map(|p| !valid.contains(&p))
+                        .unwrap_or(true)
+                });
+                if stale {
+                    let removed = kv.remove(gpu::GPU_DRM_DEV_KEY);
+                    log::warn!(
+                        "clearing stale {} for plugin {}: was {:?}",
+                        gpu::GPU_DRM_DEV_KEY,
+                        plugin_name,
+                        removed
+                    );
+                }
+            }
+        });
+    }
     let db_path = settings::default_db_path();
     let db = model::connect(&db_path)
         .await
         .with_context(|| format!("open database {}", db_path.display()))?;
 
+    // Hand the DB to the source manager so `ctx.library_meta_*`
+    // (registered as mlua async functions) can read/write
+    // `library.metadata` from inside Lua source plugins.
+    {
+        let mut sm = source_mgr.lock().await;
+        sm.attach_db(db.clone());
+    }
+
     let (shutdown_tx, shutdown_rx_for_tasks) = tokio::sync::watch::channel(false);
     let task_mgr = tasks::TaskManager::spawn(shutdown_rx_for_tasks);
 
-    let (rotation_handle, rotation_rx) = playlist::rotator::make_handle();
+    let (rotation_handle, rotation_rx) = queue::rotator::make_handle();
 
     let source_snapshot = Arc::new(tokio::sync::RwLock::new(
         plugin::source_snapshot::SourceSnapshot::default(),
@@ -273,13 +354,15 @@ async fn async_main() -> anyhow::Result<()> {
         source_snapshot,
         router: router.clone(),
         settings: settings_store,
+        gpus,
         db: db.clone(),
-        playlist: tokio::sync::Mutex::new(control::PlaylistState::default()),
+        queue: tokio::sync::Mutex::new(control::QueueState::default()),
         rotation: rotation_handle,
         events: events::EventBus::default(),
         ws_port: std::sync::atomic::AtomicU16::new(0),
         scan_in_progress: std::sync::atomic::AtomicBool::new(false),
         ui_path: std::sync::Mutex::new(None),
+        dbus_conn: std::sync::Mutex::new(None),
         shutdown: shutdown_tx,
         tasks: task_mgr.clone(),
         probe: probe.clone(),
@@ -291,22 +374,20 @@ async fn async_main() -> anyhow::Result<()> {
     {
         let app_for_rot = state.clone();
         let shutdown_for_rot = state.shutdown_subscribe();
-        state.tasks.spawn_async(
-            tasks::TaskKind::Service,
-            "playlist/rotator",
-            async move {
+        state
+            .tasks
+            .spawn_async(tasks::TaskKind::Service, "playlist/rotator", async move {
                 control::run_rotator(app_for_rot, rotation_rx, shutdown_for_rot).await;
                 Ok(())
-            },
-        );
+            });
     }
 
     // Display infrastructure first. The UDS endpoint and (if applicable)
     // the daemon-managed display backend subprocess are queued *before*
     // any source-side work so they hit the runtime as early as
     // possible — display registration must not wait on the Lua scan.
-    let mut display_registry = plugin::display_registry::build_default_registry()
-        .unwrap_or_else(|e| {
+    let mut display_registry =
+        plugin::display_registry::build_default_registry().unwrap_or_else(|e| {
             log::warn!("display registry init failed: {e:#}");
             plugin::display_registry::DisplayRegistry::new()
         });
@@ -323,7 +404,7 @@ async fn async_main() -> anyhow::Result<()> {
             }
         }
     }
-    let display_caps = display_spawner::detect_de();
+    let display_caps = display::spawner::detect_de();
     let display_backend: Option<plugin::display_registry::DisplayDef> = if cli.no_display {
         log::info!("--no-display: skipping display backend selection");
         None
@@ -332,23 +413,23 @@ async fn async_main() -> anyhow::Result<()> {
             match display_registry.find(name) {
                 Some(def) => {
                     log::info!("display backend pinned by --display-backend: {name}");
-                    display_spawner::PickOutcome::Matched(def.clone())
+                    display::spawner::PickOutcome::Matched(def.clone())
                 }
                 None => {
                     log::error!(
                         "--display-backend {name} not found in registry; falling back to auto-detect"
                     );
-                    display_spawner::pick_backend(&display_registry, &display_caps)
+                    display::spawner::pick_backend(&display_registry, &display_caps)
                 }
             }
         } else {
-            display_spawner::pick_backend(&display_registry, &display_caps)
+            display::spawner::pick_backend(&display_registry, &display_caps)
         };
-        display_spawner::log_outcome(&pick, &display_caps);
-        let should_spawn = display_spawner::should_daemon_spawn(&pick);
+        display::spawner::log_outcome(&pick, &display_caps);
+        let should_spawn = display::spawner::should_daemon_spawn(&pick);
         match pick {
-            display_spawner::PickOutcome::KdeHardMatch(def)
-            | display_spawner::PickOutcome::Matched(def)
+            display::spawner::PickOutcome::KdeHardMatch(def)
+            | display::spawner::PickOutcome::Matched(def)
                 if should_spawn =>
             {
                 Some(def)
@@ -357,20 +438,18 @@ async fn async_main() -> anyhow::Result<()> {
         }
     };
 
-    let display_sock_path = display_endpoint::default_socket_path();
+    let display_sock_path = display::endpoint::default_socket_path();
     {
         let router = router.clone();
         let sock_path = display_sock_path.clone();
         let shutdown_rx = state.shutdown_subscribe();
-        state.tasks.spawn_async(
-            tasks::TaskKind::Service,
-            "display/endpoint",
-            async move {
-                display_endpoint::serve_with_shutdown(&sock_path, router, shutdown_rx)
+        state
+            .tasks
+            .spawn_async(tasks::TaskKind::Service, "display/endpoint", async move {
+                display::endpoint::serve_with_shutdown(&sock_path, router, shutdown_rx)
                     .await
                     .map_err(|e| anyhow::anyhow!("display endpoint exited: {e}"))
-            },
-        );
+            });
     }
     if let Some(def) = display_backend {
         let sock_path = display_sock_path.clone();
@@ -380,7 +459,7 @@ async fn async_main() -> anyhow::Result<()> {
             tasks::TaskKind::Service,
             format!("display/backend/{name}"),
             async move {
-                display_spawner::run_backend(def, sock_path, shutdown_rx)
+                display::spawner::run_backend(def, sock_path, shutdown_rx)
                     .await
                     .map_err(|e| anyhow::anyhow!("display backend supervisor exited: {e}"))
             },
@@ -396,42 +475,84 @@ async fn async_main() -> anyhow::Result<()> {
         let source_mgr = source_mgr.clone();
         let plugin_dirs = cli.plugin_dirs.clone();
         let state_for_task = state.clone();
-        state.tasks.spawn_async(tasks::TaskKind::Startup, "startup/sources", async move {
-            // Step 1 — load Lua plugins off the blocking pool.
-            tokio::task::spawn_blocking(move || {
-                let mut sm = source_mgr.blocking_lock();
-                for dir in plugin::renderer_registry::standard_plugin_dirs("sources") {
-                    if dir.is_dir() {
-                        if let Err(e) = sm.load_all(&dir) {
-                            log::warn!("load sources {}: {e:#}", dir.display());
+        state
+            .tasks
+            .spawn_async(tasks::TaskKind::Startup, "startup/sources", async move {
+                // Step 1 — load Lua plugins off the blocking pool.
+                tokio::task::spawn_blocking(move || {
+                    let mut sm = source_mgr.blocking_lock();
+                    for dir in plugin::renderer_registry::standard_plugin_dirs("sources") {
+                        if dir.is_dir() {
+                            if let Err(e) = sm.load_all(&dir) {
+                                log::warn!("load sources {}: {e:#}", dir.display());
+                            }
                         }
                     }
-                }
-                for plugin_dir in &plugin_dirs {
-                    let sources_dir = plugin_dir.join("sources");
-                    if sources_dir.is_dir() {
-                        if let Err(e) = sm.load_all(&sources_dir) {
-                            log::warn!("load sources {}: {e:#}", sources_dir.display());
+                    for plugin_dir in &plugin_dirs {
+                        let sources_dir = plugin_dir.join("sources");
+                        if sources_dir.is_dir() {
+                            if let Err(e) = sm.load_all(&sources_dir) {
+                                log::warn!("load sources {}: {e:#}", sources_dir.display());
+                            }
                         }
                     }
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("plugin load join: {e}"))?;
+
+                // Step 1.5 — register loaded plugins in `source_plugin` so
+                // `auto_detect_libraries` can resolve them by name even on
+                // first boot (no libraries configured yet → step 2 below
+                // skips `refresh_sources`, which would otherwise be the
+                // first place an `upsert_plugin` runs).
+                {
+                    let infos = {
+                        let sm = state_for_task.source_manager.lock().await;
+                        sm.plugins()
+                    };
+                    match infos {
+                        Ok(infos) => {
+                            for info in infos {
+                                if let Err(e) = crate::model::repo::upsert_plugin(
+                                    &state_for_task.db,
+                                    &info.name,
+                                    &info.version,
+                                )
+                                .await
+                                {
+                                    log::warn!("upsert plugin {}: {e:#}", info.name);
+                                }
+                            }
+                        }
+                        Err(e) => log::warn!("enumerate loaded plugins: {e:#}"),
+                    }
                 }
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("plugin load join: {e}"))?;
 
-            // Step 2 — scan against DB-driven libraries + sync results
-            // + seed the playlist.
-            if let Err(e) = control::refresh_sources(&state_for_task).await {
-                log::warn!("initial source refresh failed: {e:#}");
-            }
+                // Step 2 — scan against DB-driven libraries + sync results
+                // + seed the playlist. Skip when no libraries are
+                // configured: a brand-new user has nothing to scan, and
+                // `refresh_sources` would flip `scan_in_progress` true →
+                // false in a tight window, flashing the UI loading
+                // indicator on first launch.
+                let skip_refresh = crate::model::repo::list_libraries(&state_for_task.db)
+                    .await
+                    .map(|v| v.is_empty())
+                    .unwrap_or(false);
+                if skip_refresh {
+                    log::debug!("no libraries configured; skipping initial source refresh");
+                } else if let Err(e) = control::refresh_sources(&state_for_task).await {
+                    log::warn!("initial source refresh failed: {e:#}");
+                }
 
-            // Sources + initial DB sync done. Publish the latched
-            // phase marker; the restore coordinator (separate task)
-            // observes this and the matching DisplayReady marker
-            // before kicking off the actual restore.
-            state_for_task.events.publish(events::GlobalEvent::SourcesReady);
-            Ok(())
-        });
+                // Sources + initial DB sync done. Publish the latched
+                // phase marker; the restore coordinator (separate task)
+                // observes this and the matching DisplayReady marker
+                // before kicking off the actual restore.
+                state_for_task
+                    .events
+                    .publish(events::GlobalEvent::SourcesReady);
+                Ok(())
+            });
     }
 
     // Display watcher: bridge from `Router` events to the global
@@ -445,7 +566,9 @@ async fn async_main() -> anyhow::Result<()> {
             "boot/display-watcher",
             async move {
                 if !watcher_state.router.snapshot_displays().await.is_empty() {
-                    watcher_state.events.publish(events::GlobalEvent::DisplayReady);
+                    watcher_state
+                        .events
+                        .publish(events::GlobalEvent::DisplayReady);
                     return Ok(());
                 }
                 let mut events_rx = watcher_state.router.subscribe_events();
@@ -457,9 +580,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 .publish(events::GlobalEvent::DisplayReady);
                             return Ok(());
                         }
-                        Ok(routing::RouterEvent::DisplaysReplace(list))
-                            if !list.is_empty() =>
-                        {
+                        Ok(routing::RouterEvent::DisplaysReplace(list)) if !list.is_empty() => {
                             watcher_state
                                 .events
                                 .publish(events::GlobalEvent::DisplayReady);
@@ -499,16 +620,18 @@ async fn async_main() -> anyhow::Result<()> {
             async move {
                 let mut display_rx = coord_state.events.watch_display_ready();
                 let _ = display_rx.wait_for(|v| *v).await;
-                log::info!(
-                    "restore coordinator: display registered, settling 2s before restore"
-                );
+                log::info!("restore coordinator: display registered, settling 2s before restore");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
                 let restore_state = coord_state.clone();
                 coord_state.tasks.spawn_async(
                     tasks::TaskKind::Startup,
                     "startup/restore",
-                    async move { control::run_restore(&restore_state, restore_last).await },
+                    async move {
+                        control::run_restore(&restore_state, restore_last)
+                            .await
+                            .map_err(anyhow::Error::from)
+                    },
                 );
                 Ok(())
             },
@@ -523,13 +646,13 @@ async fn async_main() -> anyhow::Result<()> {
         let probe_for_task = probe.clone();
         let db_for_task = db.clone();
         let shutdown_for_task = state.shutdown.subscribe();
-        state.tasks.spawn_async(
-            tasks::TaskKind::Service,
-            "probe/scheduler",
-            async move {
-                probe_task::scheduler_loop(db_for_task, probe_for_task, shutdown_for_task).await
-            },
-        );
+        state
+            .tasks
+            .spawn_async(tasks::TaskKind::Service, "probe/scheduler", async move {
+                probe::task::scheduler_loop(db_for_task, probe_for_task, shutdown_for_task)
+                    .await
+                    .map_err(anyhow::Error::from)
+            });
     }
 
     // Bind the WS control plane (port 0 = OS picks an available port).
@@ -541,51 +664,46 @@ async fn async_main() -> anyhow::Result<()> {
         .store(ws_port, std::sync::atomic::Ordering::SeqCst);
     log::info!("ws port: {ws_port}");
 
-    // Resolve + stash the UI path, and launch once at startup (unless --no-ui).
-    if !cli.no_ui {
-        if let Some(ui_bin) = resolve_ui_path(cli.ui_path) {
-            *state.ui_path.lock().unwrap() = Some(ui_bin);
-            spawn_ui(&state);
-        } else {
-            log::info!("waywallen-ui not found, running headless");
-        }
+    // Stash the pre-resolved UI path and launch once at startup.
+    if let Some(ui_bin) = ui_bin {
+        *state.ui_path.lock().unwrap() = Some(ui_bin);
+        spawn_ui(&state);
+    } else if !cli.no_ui {
+        log::info!("waywallen-ui not found, running headless");
     }
 
-    // Session-bus presence: publish org.waywallen.waywallen.Daemon so consumers can
-    // detect daemon (re)start via NameOwnerChanged / Ready and reconnect
-    // immediately instead of waiting for their local backoff. Optional —
-    // if the session bus is absent (e.g. TTY, embedded) we keep running.
-    let dbus_conn = match dbus_iface::connect(
+    // Publish the Daemon1 interface on the connection we already own.
+    let dbus_conn = dbus_iface::serve(
+        dbus_conn,
         state.clone(),
         display_sock_path.to_string_lossy().into_owned(),
     )
     .await
-    {
-        Ok(conn) => {
-            log::info!("DBus name acquired: {}", dbus_iface::BUS_NAME);
-            if let Err(e) = dbus_iface::emit_ready(&conn).await {
-                log::warn!("DBus Ready emit failed: {e}");
-            }
-            Some(conn)
-        }
-        Err(e) => {
-            log::warn!("DBus session bus unavailable: {e} (continuing headless)");
-            None
-        }
-    };
+    .context("publish DBus interface")?;
+    *state.dbus_conn.lock().unwrap() = Some(dbus_conn.clone());
+    if let Err(e) = dbus_iface::emit_ready(&dbus_conn).await {
+        log::warn!("DBus Ready emit failed: {e}");
+    }
 
-    // Tray icon (StatusNotifierItem) — best-effort. Requires a session bus
-    // and a StatusNotifierWatcher (Plasma, AppIndicator extension, waybar
+    // Latch DaemonReady and broadcast a fresh StatusSync so live WS
+    // clients flip phase=READY. Late connections pick the latched
+    // value up via the connect-time snapshot.
+    state.events.publish(crate::events::GlobalEvent::DaemonReady);
+    state
+        .events
+        .publish(crate::events::GlobalEvent::StatusChanged);
+
+    // Tray icon (StatusNotifierItem) — best-effort. Requires a
+    // StatusNotifierWatcher (Plasma, AppIndicator extension, waybar
     // tray, ...). No host ⇒ warn & keep running headless.
     if !cli.no_tray {
-        if let Some(conn) = dbus_conn.clone() {
-            let state_t = state.clone();
-            tokio::spawn(async move {
-                if let Err(e) = tray::spawn(conn, state_t).await {
-                    log::warn!("tray: {e} (continuing without tray)");
-                }
-            });
-        }
+        let conn = dbus_conn.clone();
+        let state_t = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tray::spawn(conn, state_t).await {
+                log::warn!("tray: {e} (continuing without tray)");
+            }
+        });
     }
 
     // SIGTERM (default `kill <pid>`, systemd stop) needs an explicit
@@ -593,9 +711,7 @@ async fn async_main() -> anyhow::Result<()> {
     // Without this branch the runtime tears down abruptly and the
     // settings debounced-writer task is dropped mid-sleep, losing any
     // pending `last_wallpaper` / `active_playlist_id` updates.
-    let mut sigterm = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate(),
-    )?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     tokio::select! {
         res = ws_fut => {
@@ -631,10 +747,8 @@ async fn async_main() -> anyhow::Result<()> {
     // and the next daemon start can't restore playback.
     state.settings.flush_now().await;
 
-    if let Some(conn) = dbus_conn.as_ref() {
-        if let Err(e) = dbus_iface::emit_shutting_down(conn).await {
-            log::warn!("DBus ShuttingDown emit failed: {e}");
-        }
+    if let Err(e) = dbus_iface::emit_shutting_down(&dbus_conn).await {
+        log::warn!("DBus ShuttingDown emit failed: {e}");
     }
     drop(dbus_conn);
 

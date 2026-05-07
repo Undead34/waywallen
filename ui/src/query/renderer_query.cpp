@@ -35,6 +35,7 @@ void RendererListQuery::reload() {
     spawn([self, backend, req = std::move(req)]() mutable -> task<void> {
         auto result = co_await backend->send(std::move(req));
         co_await asio::post(asio::bind_executor(self->get_executor(), use_task));
+        if (! self) co_return;
 
         self->inspect_set(result, [self](const proto::Response& rsp) {
             auto& list_rsp = rsp.rendererList();
@@ -92,6 +93,7 @@ void RendererPluginListQuery::reload() {
     spawn([self, backend, req = std::move(req)]() mutable -> task<void> {
         auto result = co_await backend->send(std::move(req));
         co_await asio::post(asio::bind_executor(self->get_executor(), use_task));
+        if (! self) co_return;
 
         self->inspect_set(result, [self](const proto::Response& rsp) {
             auto& list_rsp = rsp.rendererPluginList();
@@ -108,6 +110,34 @@ void RendererPluginListQuery::reload() {
                     types.append(t);
                 }
                 m[u"types"_s] = types;
+
+                // Flatten SettingSchema entries to QVariantMaps so QML can
+                // build a typed form without touching protobuf objects. The
+                // `type` enum is exposed as an integer (matches the proto
+                // `SettingValueType` numeric values: U32=1, F32=2, STRING=3,
+                // BOOL=4) so QML compares with plain integer literals.
+                QVariantList settings;
+                for (const auto& s : r.settings()) {
+                    QVariantMap sm;
+                    sm[u"key"_s]             = s.key();
+                    sm[u"type"_s]            = static_cast<int>(s.type());
+                    sm[u"default_value"_s]   = s.defaultValue();
+                    sm[u"identity"_s]        = s.identity();
+                    sm[u"label_key"_s]       = s.labelKey();
+                    sm[u"description_key"_s] = s.descriptionKey();
+                    sm[u"min"_s]             = s.min();
+                    sm[u"max"_s]             = s.max();
+                    sm[u"step"_s]            = s.step();
+                    QStringList choices;
+                    for (const auto& c : s.choices()) {
+                        choices.append(c);
+                    }
+                    sm[u"choices"_s] = choices;
+                    sm[u"group"_s]   = s.group();
+                    sm[u"order"_s]   = static_cast<int>(s.order());
+                    settings.append(sm);
+                }
+                m[u"settings"_s] = settings;
                 items.append(m);
             }
             self->m_renderers = std::move(items);
@@ -153,6 +183,7 @@ void RendererKillQuery::reload() {
     spawn([self, backend, req = std::move(req)]() mutable -> task<void> {
         auto result = co_await backend->send(std::move(req));
         co_await asio::post(asio::bind_executor(self->get_executor(), use_task));
+        if (! self) co_return;
 
         self->inspect_set(result, [](const proto::Response&) {});
         co_return;

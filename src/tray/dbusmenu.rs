@@ -167,14 +167,16 @@ impl DBusMenu {
             }
             ID_SHUFFLE => {
                 let was_on = matches!(
-                    app.playlist.lock().await.mode,
-                    crate::playlist::Mode::Shuffle
+                    app.queue.lock().await.mode,
+                    crate::queue::Mode::Shuffle
                 );
                 control::set_shuffle(&app, !was_on).await;
             }
             ID_ROT_OFF | ID_ROT_30S | ID_ROT_1M | ID_ROT_5M | ID_ROT_15M | ID_ROT_1H => {
-                if let Some((_, _, secs)) =
-                    rotate_options().iter().copied().find(|(rid, _, _)| *rid == id)
+                if let Some((_, _, secs)) = rotate_options()
+                    .iter()
+                    .copied()
+                    .find(|(rid, _, _)| *rid == id)
                 {
                     control::set_rotation_interval(&app, secs).await;
                 }
@@ -252,19 +254,40 @@ struct MenuState {
 }
 
 async fn snapshot_menu_state(app: &Arc<AppState>) -> MenuState {
-    let mode = app.playlist.lock().await.mode;
+    // Read from settings — the canonical source. Queue's in-memory
+    // mode matches (Phase 5 keeps them in sync), but settings stays
+    // truthful even if the queue was just reset / not yet restored.
+    let g = app.settings.global();
     MenuState {
-        is_shuffle: matches!(mode, crate::playlist::Mode::Shuffle),
-        rotation_secs: app.rotation.interval(),
+        is_shuffle: g.queue_mode == "shuffle",
+        rotation_secs: g.rotation_secs,
     }
 }
 
-// `LayoutUpdated` signal emission is intentionally omitted — KDE
-// Plasma's tray re-fetches `GetLayout` every time the menu is
-// re-opened, so the checkmark / radio state catches up on the next
-// click anyway. Wiring the signal would require stashing the zbus
-// `Connection` on `AppState`, which is more plumbing than the UX
-// improvement merits at this point.
+/// Best-effort `LayoutUpdated` emission. Called from `control::*`
+/// helpers when state that affects checkmark / radio rendering changes
+/// (mode toggle, rotation interval). Without this the radios in the
+/// Rotate submenu visually stack — KDE only re-fetches on menu
+/// re-open, so a single click while the menu is open looks
+/// multi-select.
+pub async fn notify_menu_changed(app: &AppState) {
+    let conn = match app.dbus_conn.lock().unwrap().clone() {
+        Some(c) => c,
+        None => return,
+    };
+    let iface = match conn
+        .object_server()
+        .interface::<_, DBusMenu>(crate::tray::MENU_PATH)
+        .await
+    {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    // Bump the layout revision; parent = ID_ROOT means "everything below
+    // root may have changed". KDE responds with a single GetLayout
+    // round-trip that walks the whole tree.
+    let _ = DBusMenu::layout_updated(iface.signal_context(), 1, ID_ROOT).await;
+}
 
 // ---------------------------------------------------------------------------
 // Static menu tree
@@ -292,9 +315,7 @@ fn build_root(menu: &MenuState) -> ItemStruct {
 fn build_rotate_submenu(menu: &MenuState) -> ItemStruct {
     let children: Vec<OwnedValue> = rotate_options()
         .iter()
-        .map(|(id, label, secs)| {
-            item_to_value(make_radio(*id, label, menu.rotation_secs == *secs))
-        })
+        .map(|(id, label, secs)| item_to_value(make_radio(*id, label, menu.rotation_secs == *secs)))
         .collect();
     let mut props = HashMap::new();
     props.insert(
@@ -388,9 +409,7 @@ fn props_for(id: i32, menu: &MenuState) -> Option<HashMap<String, OwnedValue>> {
         ID_OPEN_UI => Some(make_leaf(id, "Open UI", None).1),
         ID_NEXT => Some(make_leaf(id, "Next", None).1),
         ID_PREV => Some(make_leaf(id, "Previous", None).1),
-        ID_SEP1 | ID_SEP2 | ID_SEP3 | ID_SEP_PL => {
-            Some(make_leaf(id, "", Some("separator")).1)
-        }
+        ID_SEP1 | ID_SEP2 | ID_SEP3 | ID_SEP_PL => Some(make_leaf(id, "", Some("separator")).1),
         ID_SHUFFLE => Some(make_checkmark(id, "Shuffle", menu.is_shuffle).1),
         ID_ROTATE => Some(make_submenu_parent(id, "Rotate").1),
         ID_ROT_OFF | ID_ROT_30S | ID_ROT_1M | ID_ROT_5M | ID_ROT_15M | ID_ROT_1H => {
@@ -439,14 +458,16 @@ async fn dispatch_click(app: &Arc<AppState>, id: i32) -> zbus::fdo::Result<()> {
         }
         ID_SHUFFLE => {
             let was_on = matches!(
-                app.playlist.lock().await.mode,
-                crate::playlist::Mode::Shuffle
+                app.queue.lock().await.mode,
+                crate::queue::Mode::Shuffle
             );
             control::set_shuffle(app, !was_on).await;
         }
         ID_ROT_OFF | ID_ROT_30S | ID_ROT_1M | ID_ROT_5M | ID_ROT_15M | ID_ROT_1H => {
-            if let Some((_, _, secs)) =
-                rotate_options().iter().copied().find(|(rid, _, _)| *rid == id)
+            if let Some((_, _, secs)) = rotate_options()
+                .iter()
+                .copied()
+                .find(|(rid, _, _)| *rid == id)
             {
                 control::set_rotation_interval(app, secs).await;
             }

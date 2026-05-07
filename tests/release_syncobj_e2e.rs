@@ -17,14 +17,13 @@ use std::time::Duration;
 
 mod common;
 
-use waywallen::ipc::generated::{Event as EventMsg, Request as ControlMsg};
+use waywallen::ipc::generated::{Event as EventMsg, EventIn as ControlMsg};
 use waywallen::ipc::uds::{recv_event, send_control};
 use waywallen::sync::DrmDevice;
 
 fn renderer_bin() -> Option<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let candidate = manifest
-        .join("plugins/image/build/waywallen-image-renderer");
+    let candidate = manifest.join("plugins/image/build/waywallen-image-renderer");
     if candidate.exists() {
         return Some(candidate);
     }
@@ -63,15 +62,15 @@ fn release_syncobj_round_trip() {
     let listener = UnixListener::bind(&sock_path).expect("bind");
     let _cleanup = common::SockCleanup(sock_path.clone());
 
+    // SPAWN_VERSION 3: image path arrives via `--path`; extent +
+    // settings ride on the typed Init message we send right after
+    // accept. The image renderer's manifest declares `fps`, but we
+    // pass an empty kv list — defaults are fine for this smoke.
     let child = Command::new(&bin)
         .arg("--ipc")
         .arg(&sock_path)
-        .arg("--image")
+        .arg("--path")
         .arg(&img)
-        .arg("--width")
-        .arg("640")
-        .arg("--height")
-        .arg("360")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -88,6 +87,21 @@ fn release_syncobj_round_trip() {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("set rd timeout");
+
+    // Drive the daemon's role: send Init so the renderer can move
+    // past `ww_bridge_recv_init`.
+    send_control(
+        &stream,
+        &ControlMsg::Init {
+            spawn_version: 4,
+            extent_w: 640,
+            extent_h: 360,
+            extent_mode: 0,
+            settings: Vec::new(),
+        },
+        &[],
+    )
+    .expect("send Init");
 
     let mut saw_ready = false;
     let mut saw_release_syncobj_fd: Option<OwnedFd> = None;
@@ -111,7 +125,6 @@ fn release_syncobj_round_trip() {
                 fourccs,
                 mod_counts,
                 modifiers,
-                usages,
                 plane_counts,
                 device_uuid,
                 driver_uuid,
@@ -123,12 +136,11 @@ fn release_syncobj_round_trip() {
                 extent_max_w,
                 extent_max_h,
             } => {
-                use waywallen::negotiate as N;
+                use waywallen::dma::negotiate as N;
                 let caps = N::unflatten_caps(
                     &fourccs,
                     &mod_counts,
                     &modifiers,
-                    &usages,
                     &plane_counts,
                     &device_uuid,
                     &driver_uuid,
@@ -179,8 +191,6 @@ fn release_syncobj_round_trip() {
                         sync_mode: N::SYNC_SYNCOBJ_TIMELINE,
                         color: N::DEFAULT_COLOR,
                         mem_hint: N::MEM_HINT_HOST_VISIBLE,
-                        extent_w: 640,
-                        extent_h: 360,
                         count: 1,
                         path: N::PathCategory::CompatLinear.as_u32(),
                         mem_source: N::MemSource::GpuLinear.as_u32(),
@@ -202,9 +212,7 @@ fn release_syncobj_round_trip() {
                 drop(fds);
             }
             EventMsg::FrameReady {
-                seq,
-                release_point,
-                ..
+                seq, release_point, ..
             } => {
                 assert_eq!(fds.len(), 1, "FrameReady expected 1 acquire sync_fd");
                 drop(fds);

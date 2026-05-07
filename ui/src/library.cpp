@@ -27,7 +27,7 @@ Library::Library(const proto::LibraryInstance& info, QObject* parent)
       m_plugin_name(info.pluginName()) {}
 
 void Library::updateFrom(const proto::LibraryInstance& info) {
-    assert(info.id_proto() == m_id, "Library::updateFrom id mismatch");
+    rstd_assert(info.id_proto() == m_id, "Library::updateFrom id mismatch");
 
     if (m_path != info.path()) {
         m_path = info.path();
@@ -76,7 +76,7 @@ auto LibraryManager::get(qint64 id) const -> Library* {
 }
 
 void LibraryManager::replaceAll(const QList<proto::LibraryInstance>& list) {
-    cppstd::map<qint64, Library*> next_by_id;
+    std::map<qint64, Library*> next_by_id;
     QList<Library*>               next_ordered;
     next_ordered.reserve(list.size());
 

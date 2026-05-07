@@ -18,6 +18,11 @@ export class WallpaperListQuery : public QueryList,
     QML_ELEMENT
 
     Q_PROPERTY(QString wpType READ wpType WRITE setWpType NOTIFY wpTypeChanged FINAL)
+    Q_PROPERTY(QList<waywallen::control::v1::WallpaperFilterRule> filters READ filters WRITE
+                   setFilters NOTIFY filtersChanged FINAL)
+    Q_PROPERTY(QList<waywallen::control::v1::FilterLogic> filterLogics READ filterLogics WRITE
+                   setFilterLogics NOTIFY filterLogicsChanged FINAL)
+    Q_PROPERTY(bool hasActiveFilters READ hasActiveFilters NOTIFY filtersChanged FINAL)
     Q_PROPERTY(qint32 total READ total NOTIFY totalChanged FINAL)
 
 public:
@@ -26,17 +31,32 @@ public:
     auto wpType() const -> const QString&;
     void setWpType(const QString&);
 
+    auto filters() const -> const QList<control::v1::WallpaperFilterRule>&;
+    void setFilters(const QList<control::v1::WallpaperFilterRule>&);
+
+    auto filterLogics() const -> const QList<control::v1::FilterLogic>&;
+    void setFilterLogics(const QList<control::v1::FilterLogic>&);
+    Q_INVOKABLE bool replaceFilterState(const QList<control::v1::WallpaperFilterRule>&,
+                                        const QList<control::v1::FilterLogic>&);
+
+    auto hasActiveFilters() const -> bool;
+
     auto total() const -> qint32;
 
     void reload() override;
     void fetchMore(qint32) override;
 
     Q_SIGNAL void wpTypeChanged();
+    Q_SIGNAL void filterStateChanged();
+    Q_SIGNAL void filtersChanged();
+    Q_SIGNAL void filterLogicsChanged();
     Q_SIGNAL void totalChanged();
 
 private:
-    QString m_wp_type;
-    qint32  m_total { 0 };
+    QString                               m_wp_type;
+    QList<control::v1::WallpaperFilterRule> m_filters;
+    QList<control::v1::FilterLogic>         m_filter_logics;
+    qint32                                  m_total { 0 };
 };
 
 export class WallpaperScanQuery : public Query, public QueryExtra<control::v1::Response, WallpaperScanQuery> {
@@ -65,6 +85,9 @@ export class WallpaperApplyQuery : public Query, public QueryExtra<control::v1::
     Q_PROPERTY(waywallen::model::Wallpaper wallpaper READ wallpaper WRITE setWallpaper NOTIFY wallpaperChanged FINAL)
     /// Target display ids. Empty list = "apply to all displays" (legacy default).
     Q_PROPERTY(QVariantList displayIds READ displayIds WRITE setDisplayIds NOTIFY displayIdsChanged FINAL)
+    /// Optional renderer plugin name. Empty (default) lets the daemon pick
+    /// the highest-priority renderer for this wallpaper's type.
+    Q_PROPERTY(QString rendererName READ rendererName WRITE setRendererName NOTIFY rendererNameChanged FINAL)
     Q_PROPERTY(QString rendererId READ rendererId NOTIFY rendererIdChanged FINAL)
 
 public:
@@ -76,17 +99,22 @@ public:
     auto displayIds() const -> const QVariantList&;
     void setDisplayIds(const QVariantList&);
 
+    auto rendererName() const -> const QString&;
+    void setRendererName(const QString&);
+
     auto rendererId() const -> const QString&;
 
     void reload() override;
 
     Q_SIGNAL void wallpaperChanged();
     Q_SIGNAL void displayIdsChanged();
+    Q_SIGNAL void rendererNameChanged();
     Q_SIGNAL void rendererIdChanged();
 
 private:
     model::Wallpaper m_wallpaper;
     QVariantList     m_display_ids;
+    QString          m_renderer_name;
     QString          m_renderer_id;
 };
 

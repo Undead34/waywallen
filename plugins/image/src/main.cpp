@@ -6,6 +6,9 @@
 //   - Staging buffer + command buffer (uploads RGBA into a bridge slot)
 //   - libav decode pipeline
 
+import rstd;
+import wavsen.video;
+
 #include <waywallen-bridge/bridge.h>
 #include <waywallen-bridge/drm_fourcc.h>
 #include <waywallen-bridge/ipc_v1.h>
@@ -13,7 +16,6 @@
 #include <waywallen-bridge/probe_vk.h>
 
 #include "av_image.hpp"
-#include "vk_producer.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -36,16 +38,17 @@ namespace {
 struct Options {
     std::string ipc_path;
     std::string image_path;
+    /* Daemon-supplied size hint. After decode they are overwritten with
+     * the resolved render extent (`ww_resolve_extent`). */
     uint32_t    width { 1920 };
     uint32_t    height { 1080 };
+    /* Wire-level interpretation of `width`/`height`. `0` = AS_GIVEN. */
+    uint32_t    extent_mode { 0 };
     bool        decode_only { false };
     bool        vulkan_probe { false };
-    // Test hook: probe the picked Vulkan device for supported (fourcc,
-    // modifier) pairs and emit a `PeerCaps`-shaped JSON document on
-    // stdout, then exit. Consumed by the dmabuf_roundtrip_e2e test
-    // orchestrator to compute the producer × consumer cap intersection
-    // before per-pair iteration.
+    // Test hook
     bool        print_caps { false };
+    std::string render_node;
 };
 
 [[noreturn]] void die(const std::string& msg) {
@@ -53,6 +56,10 @@ struct Options {
     std::exit(1);
 }
 
+// SPAWN_VERSION 3: argv carries the canonical `--path` for the image
+// resource plus `--ipc`. Per-plugin runtime settings (fps, etc.) come
+// in via `Init.settings` kv. Standalone-debug flags (`--decode-only`,
+// `--vulkan-probe`, `--print-caps`) are still parsed here.
 Options parse_args(int argc, char** argv) {
     Options o;
     for (int i = 1; i < argc; ++i) {
@@ -61,14 +68,18 @@ Options parse_args(int argc, char** argv) {
             if (i + 1 >= argc) return {};
             return argv[++i];
         };
-        if (a == "--ipc")              o.ipc_path = next();
-        else if (a == "--width")       o.width = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
-        else if (a == "--height")      o.height = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
-        else if (a == "--image" || a == "--path") o.image_path = next();
-        else if (a == "--decode-only") o.decode_only = true;
+        if (a == "--ipc")               o.ipc_path = next();
+        else if (a == "--path")         o.image_path = next();
+        else if (a == "--decode-only")  o.decode_only = true;
         else if (a == "--vulkan-probe") o.vulkan_probe = true;
-        else if (a == "--print-caps")  o.print_caps = true;
-        else ww_bridge_skip_unknown_kv_arg(&i, argc, argv);
+        else if (a == "--print-caps")   o.print_caps = true;
+        else if (a == "--render-node")  o.render_node = next();
+        // Tolerate other `--key value` extras (none defined for image
+        // today) by skipping their value.
+        else if (a.size() >= 2 && a[0] == '-' && a[1] == '-' && i + 1 < argc) {
+            std::string nxt = argv[i + 1];
+            if (!(nxt.size() >= 2 && nxt[0] == '-' && nxt[1] == '-')) ++i;
+        }
     }
     return o;
 }
@@ -175,7 +186,7 @@ static void maybe_dump_producer_frame(const HostState& host,
     std::fclose(sf);
 }
 
-bool upload_to_slot(HostState& host, ww_image::VkProducer& producer,
+bool upload_to_slot(HostState& host, wavsen::video::Producer& producer,
                     const ww_pool_directive_t& directive,
                     uint32_t slot_index) {
     ww_pool_slot_t s {};
@@ -197,17 +208,17 @@ bool upload_to_slot(HostState& host, ww_image::VkProducer& producer,
     maybe_dump_producer_frame(host, directive, s,
                               g_dump_seq.fetch_add(1, std::memory_order_relaxed));
 
-    std::string uerr;
-    int sync_fd = producer.upload_into(
+    auto upload_res = producer.upload_into(
         reinterpret_cast<VkImage>(s.vk_image),
         s.width, s.height,
-        host.rgba_data, host.rgba_size, &uerr);
-    if (sync_fd < 0) {
+        host.rgba_data, host.rgba_size);
+    if (upload_res.is_err()) {
         std::fprintf(stderr,
                      "waywallen-image-renderer: upload_into failed: %s\n",
-                     uerr.c_str());
+                     std::move(upload_res).unwrap_err().message.c_str());
         return false;
     }
+    int sync_fd = std::move(upload_res).unwrap();
     if (int rc = ww_bridge_pool_submit_slot(host.pool, host.sock, slot_index, sync_fd);
         rc != 0) {
         std::fprintf(stderr,
@@ -220,7 +231,7 @@ bool upload_to_slot(HostState& host, ww_image::VkProducer& producer,
 /* Apply a directive received from the daemon. After bridge brings the
  * slots up, upload our cached RGBA into slot 0 and submit one frame.
  * Static images: a single submit per (re-)negotiation is enough. */
-void apply_negotiate_request(HostState& host, ww_image::VkProducer& producer,
+void apply_negotiate_request(HostState& host, wavsen::video::Producer& producer,
                              const ww_pool_directive_t& d) {
     int rc = ww_bridge_pool_apply_directive(host.pool, host.sock, &d);
     if (rc != 0) {
@@ -241,24 +252,49 @@ void apply_negotiate_request(HostState& host, ww_image::VkProducer& producer,
                  static_cast<unsigned long long>(d.modifier));
 }
 
-void apply_control(HostState& host, const ww_bridge_control_t& c) {
+void apply_control(HostState& host, ww_bridge_control_t& c) {
     switch (c.op) {
-    case WW_REQ_HELLO:
-    case WW_REQ_PLAY:
-    case WW_REQ_PAUSE:
-    case WW_REQ_MOUSE:
-    case WW_REQ_SET_FPS:
-        break;
-    case WW_REQ_LOAD_SCENE:
+    case WW_EVT_IN_INIT:
+        // Init is consumed by ww_bridge_recv_init at the top of main
+        // before the reader thread is even spawned. Anything that
+        // arrives here is either a buggy daemon resending it or a
+        // protocol violation; log and ignore to stay liberal.
         std::fprintf(stderr,
-                     "waywallen-image-renderer: load_scene pkg=%s "
-                     "(hot-swap not yet implemented)\n",
-                     c.u.load_scene.pkg ? c.u.load_scene.pkg : "(null)");
+                     "waywallen-image-renderer: unexpected late Init; ignoring\n");
         break;
-    case WW_REQ_SHUTDOWN:
+    case WW_EVT_IN_PLAY:
+    case WW_EVT_IN_PAUSE:
+    case WW_EVT_IN_SET_FPS:
+    case WW_EVT_IN_POINTER_MOTION:
+    case WW_EVT_IN_POINTER_BUTTON:
+    case WW_EVT_IN_POINTER_AXIS:
+        // image renderer doesn't subscribe to pointer events; daemon
+        // already gates these (manifest sans `events`), but stay
+        // permissive in case a misconfigured daemon forwards anyway.
+        break;
+    case WW_EVT_IN_SETTING_CHANGED: {
+        // The image renderer's manifest declares no settings, so an
+        // ApplySettings should arrive empty. If the daemon sends a
+        // non-empty kv list (e.g. the user added a tunable key in
+        // `settings.toml` that no schema declares), warn-log and
+        // discard so we don't surprise the user with silent drops.
+        ww_bridge_setting_changed_t as {};
+        if (ww_bridge_setting_changed_from_control(&c, &as) == 0) {
+            if (as.settings.count > 0) {
+                std::fprintf(stderr,
+                             "waywallen-image-renderer: ApplySettings "
+                             "with %u keys but no hot-reloadable settings; "
+                             "ignoring\n",
+                             as.settings.count);
+            }
+            ww_bridge_setting_changed_free(&as);
+        }
+        break;
+    }
+    case WW_EVT_IN_SHUTDOWN:
         signal_shutdown(host);
         break;
-    case WW_REQ_NEGOTIATE_BUFFERS: {
+    case WW_EVT_IN_NEGOTIATE_BUFFERS: {
         const auto& nb = c.u.negotiate_buffers;
         ww_pool_directive_t d {};
         d.category    = nb.path;
@@ -269,8 +305,6 @@ void apply_control(HostState& host, const ww_bridge_control_t& c) {
         d.sync_mode   = nb.sync_mode;
         d.color       = nb.color;
         d.mem_hint    = nb.mem_hint;
-        d.width       = nb.extent_w;
-        d.height      = nb.extent_h;
         /* Static image: one slot is enough. */
         d.count       = 1;
         {
@@ -322,13 +356,13 @@ void reader_loop(HostState& host) {
 // a `socketpair(AF_UNIX)`, ask it to advertise, then drain the
 // `format_caps` message on the other end and decode it.
 static int print_caps_json(const Options& opt) {
-    std::string verr;
-    auto producer = ww_image::VkProducer::create(opt.width, opt.height, &verr);
-    if (!producer) {
+    auto producer_res = wavsen::video::Producer::create(opt.width, opt.height);
+    if (producer_res.is_err()) {
         std::fprintf(stderr, "waywallen-image-renderer: vk_producer: %s\n",
-                     verr.c_str());
+                     std::move(producer_res).unwrap_err().message.c_str());
         return 1;
     }
+    auto producer = std::move(producer_res).unwrap();
 
     int sv[2] = { -1, -1 };
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -351,6 +385,10 @@ static int print_caps_json(const Options& opt) {
     pool_init.drm_render_major      = producer->drm_render_major();
     pool_init.drm_render_minor      = producer->drm_render_minor();
     pool_init.drm_render_fd         = producer->drm_render_fd();
+    /* Image plugin uses vkCmdCopyBufferToImage (TRANSFER_DST feature)
+     * to upload decoded pixels into the slot. */
+    pool_init.image_usage_flags     = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    pool_init.format_feature_flags  = VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
 
     ww_pool_t* pool = nullptr;
     if (int rc = ww_bridge_pool_create(WW_POOL_BACKEND_VULKAN, &pool_init, &pool);
@@ -440,10 +478,9 @@ static int print_caps_json(const Options& opt) {
         const uint32_t n  = caps.mod_counts.data[i];
         std::printf("    \"0x%08x\": [", fc);
         for (uint32_t j = 0; j < n; ++j) {
-            std::printf("%s\n      {\"modifier\": %llu, \"usage\": %u, \"plane_count\": %u}",
+            std::printf("%s\n      {\"modifier\": %llu, \"plane_count\": %u}",
                         j ? "," : "",
                         static_cast<unsigned long long>(caps.modifiers.data[cursor + j]),
-                        caps.usages.data[cursor + j],
                         caps.plane_counts.data[cursor + j]);
         }
         cursor += n;
@@ -479,13 +516,13 @@ int main(int argc, char** argv) {
     }
 
     if (opt.vulkan_probe) {
-        std::string verr;
-        auto prod = ww_image::VkProducer::create(opt.width, opt.height, &verr);
-        if (!prod) {
+        auto prod_res = wavsen::video::Producer::create(opt.width, opt.height);
+        if (prod_res.is_err()) {
             std::fprintf(stderr, "waywallen-image-renderer: vk_producer: %s\n",
-                         verr.c_str());
+                         std::move(prod_res).unwrap_err().message.c_str());
             return 1;
         }
+        auto prod = std::move(prod_res).unwrap();
         std::fprintf(stderr,
                      "waywallen-image-renderer: vulkan_probe ok "
                      "drm_render=%u:%u\n",
@@ -497,7 +534,8 @@ int main(int argc, char** argv) {
         if (opt.image_path.empty()) die("--decode-only requires --image");
         ww_image::DecodeError derr;
         ww_image::RgbaBuf buf =
-            ww_image::decode_to_rgba(opt.image_path, opt.width, opt.height, &derr);
+            ww_image::decode_to_rgba(opt.image_path, opt.width, opt.height,
+                                     /* extent_mode = */ 0, &derr);
         if (buf.data.empty()) {
             std::fprintf(stderr,
                          "waywallen-image-renderer: decode failed: %s\n",
@@ -519,16 +557,71 @@ int main(int argc, char** argv) {
 
     ::prctl(PR_SET_PDEATHSIG, SIGTERM);
 
+    /* --- Connect first, then read the Init message ---
+     *
+     * Step 3: connect() moved to before any decode / Vulkan init so
+     * the daemon's typed Init payload (extent + image path) drives
+     * the GPU pipeline rather than CLI argv. The legacy `--image`/
+     * `--width`/`--height` argv is still emitted by the daemon
+     * double-send but we ignore it here. */
+    HostState host;
+    host.sock = ww_bridge_connect(opt.ipc_path.c_str());
+    if (host.sock < 0)
+        die("ww_bridge_connect: " + std::string(std::strerror(-host.sock)));
+
+    ww_bridge_init_t init {};
+    if (int rc = ww_bridge_recv_init(host.sock, &init); rc < 0) {
+        // Surface the rejection structured-ly so the daemon's spawn()
+        // gets a useful error string. `init.spawn_version` is filled
+        // by recv_init even on -EPROTO (version mismatch).
+        const char* reason = (rc == -EPROTO)
+            ? "init: protocol error or unsupported spawn_version"
+            : "init: recv failed";
+        ww_bridge_send_init_nack(host.sock, init.spawn_version,
+                                 WW_BRIDGE_SUPPORTED_SPAWN_VERSION,
+                                 reason);
+        ww_bridge_init_free(&init);
+        die(std::string(reason) + " rc=" + std::to_string(rc));
+    }
+
+    // SPAWN_VERSION 3: image path arrives via CLI argv `--path`
+    // (already parsed into opt.image_path). Init carries only extent.
+    opt.width       = init.extent_w;
+    opt.height      = init.extent_h;
+    opt.extent_mode = init.extent_mode;
+    if (opt.render_node.empty()) {
+        for (size_t i = 0; i < init.settings.count; ++i) {
+            const ww_kv_t& kv = init.settings.data[i];
+            if (kv.key && std::strcmp(kv.key, "render_node") == 0
+                && kv.value && *kv.value) {
+                opt.render_node = kv.value;
+                break;
+            }
+        }
+    }
+    ww_bridge_init_free(&init);
+
     /* --- Decode + Vulkan setup --- */
-    if (opt.image_path.empty()) die("--image is required");
+    if (opt.image_path.empty()) die("--path <image-file> is required");
     ww_image::DecodeError derr;
     ww_image::RgbaBuf rgba_buf = ww_image::decode_to_rgba(
-        opt.image_path, opt.width, opt.height, &derr);
+        opt.image_path, opt.width, opt.height, opt.extent_mode, &derr);
     if (rgba_buf.data.empty()) die("decode " + opt.image_path + ": " + derr.message);
 
-    std::string verr;
-    auto producer = ww_image::VkProducer::create(opt.width, opt.height, &verr);
-    if (!producer) die("vk_producer: " + verr);
+    /* `decode_to_rgba` resolved the daemon's hint against the image's
+     * native size; from here on we work with the resolved render
+     * extent. */
+    opt.width  = rgba_buf.width;
+    opt.height = rgba_buf.height;
+
+    auto producer_res = opt.render_node.empty()
+        ? wavsen::video::Producer::create(opt.width, opt.height)
+        : wavsen::video::Producer::create_with_render_node(
+              opt.width, opt.height, opt.render_node);
+    if (producer_res.is_err()) {
+        die("vk_producer: " + std::move(producer_res).unwrap_err().message);
+    }
+    auto producer = std::move(producer_res).unwrap();
 
     /* GPU info diagnostic (uses bridge probe_vk dispatch table). */
     ww_bridge_vk_dt_t vdt {};
@@ -536,10 +629,6 @@ int main(int argc, char** argv) {
     ww_bridge_vk_log_gpu_info("waywallen-image-renderer", &vdt,
                               producer->physical_device());
 
-    HostState host;
-    host.sock = ww_bridge_connect(opt.ipc_path.c_str());
-    if (host.sock < 0)
-        die("ww_bridge_connect: " + std::string(std::strerror(-host.sock)));
     host.rgba_data = rgba_buf.data.data();
     host.rgba_size = rgba_buf.data.size();
 
@@ -557,6 +646,8 @@ int main(int argc, char** argv) {
     pool_init.drm_render_major      = producer->drm_render_major();
     pool_init.drm_render_minor      = producer->drm_render_minor();
     pool_init.drm_render_fd         = producer->drm_render_fd();
+    pool_init.image_usage_flags     = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    pool_init.format_feature_flags  = VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
 
     if (int rc = ww_bridge_pool_create(WW_POOL_BACKEND_VULKAN, &pool_init, &host.pool);
         rc != 0)

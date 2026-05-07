@@ -19,6 +19,8 @@ use sea_orm::{
 use sea_orm_migration::MigratorTrait;
 
 pub mod entities;
+pub mod filter;
+pub mod fts;
 pub mod migration;
 pub mod repo;
 pub mod sync;

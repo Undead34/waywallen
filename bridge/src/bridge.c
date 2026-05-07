@@ -357,8 +357,6 @@ int ww_bridge_send_format_caps_v2(int sock,
     e.mod_counts.data     = (uint32_t *)m->mod_counts;
     e.modifiers.count     = m->modifiers_count;
     e.modifiers.data      = (uint64_t *)m->modifiers;
-    e.usages.count        = m->usages_count;
-    e.usages.data         = (uint32_t *)m->usages;
     e.plane_counts.count  = m->plane_counts_count;
     e.plane_counts.data   = (uint32_t *)m->plane_counts;
     e.device_uuid.count   = 4;
@@ -450,32 +448,42 @@ int ww_bridge_recv_control(int sock, ww_bridge_control_t *out) {
         return WW_ERR_UNKNOWN_OPCODE; /* closest available code */
     }
 
-    out->op = (ww_request_op_t)opcode;
+    out->op = (ww_event_in_op_t)opcode;
     switch (out->op) {
-    case WW_REQ_HELLO:
-        rc = ww_req_hello_decode(body, body_len, &out->u.hello);
+    case WW_EVT_IN_INIT:
+        rc = ww_evt_in_init_decode(body, body_len, &out->u.init);
         break;
-    case WW_REQ_LOAD_SCENE:
-        rc = ww_req_load_scene_decode(body, body_len, &out->u.load_scene);
+    case WW_EVT_IN_SETTING_CHANGED:
+        rc = ww_evt_in_setting_changed_decode(body, body_len,
+                                              &out->u.setting_changed);
         break;
-    case WW_REQ_PLAY:
-        rc = ww_req_play_decode(body, body_len, &out->u.play);
+    case WW_EVT_IN_PLAY:
+        rc = ww_evt_in_play_decode(body, body_len, &out->u.play);
         break;
-    case WW_REQ_PAUSE:
-        rc = ww_req_pause_decode(body, body_len, &out->u.pause);
+    case WW_EVT_IN_PAUSE:
+        rc = ww_evt_in_pause_decode(body, body_len, &out->u.pause);
         break;
-    case WW_REQ_MOUSE:
-        rc = ww_req_mouse_decode(body, body_len, &out->u.mouse);
+    case WW_EVT_IN_POINTER_MOTION:
+        rc = ww_evt_in_pointer_motion_decode(body, body_len,
+                                             &out->u.pointer_motion);
         break;
-    case WW_REQ_SET_FPS:
-        rc = ww_req_set_fps_decode(body, body_len, &out->u.set_fps);
+    case WW_EVT_IN_POINTER_BUTTON:
+        rc = ww_evt_in_pointer_button_decode(body, body_len,
+                                             &out->u.pointer_button);
         break;
-    case WW_REQ_SHUTDOWN:
-        rc = ww_req_shutdown_decode(body, body_len, &out->u.shutdown);
+    case WW_EVT_IN_POINTER_AXIS:
+        rc = ww_evt_in_pointer_axis_decode(body, body_len,
+                                           &out->u.pointer_axis);
         break;
-    case WW_REQ_NEGOTIATE_BUFFERS:
-        rc = ww_req_negotiate_buffers_decode(body, body_len,
-                                             &out->u.negotiate_buffers);
+    case WW_EVT_IN_SET_FPS:
+        rc = ww_evt_in_set_fps_decode(body, body_len, &out->u.set_fps);
+        break;
+    case WW_EVT_IN_SHUTDOWN:
+        rc = ww_evt_in_shutdown_decode(body, body_len, &out->u.shutdown);
+        break;
+    case WW_EVT_IN_NEGOTIATE_BUFFERS:
+        rc = ww_evt_in_negotiate_buffers_decode(body, body_len,
+                                                &out->u.negotiate_buffers);
         break;
     default:
         rc = WW_ERR_UNKNOWN_OPCODE;
@@ -489,15 +497,21 @@ int ww_bridge_recv_control(int sock, ww_bridge_control_t *out) {
 void ww_bridge_control_free(ww_bridge_control_t *msg) {
     if (!msg) return;
     switch (msg->op) {
-    case WW_REQ_HELLO:      ww_req_hello_free(&msg->u.hello); break;
-    case WW_REQ_LOAD_SCENE: ww_req_load_scene_free(&msg->u.load_scene); break;
-    case WW_REQ_PLAY:       ww_req_play_free(&msg->u.play); break;
-    case WW_REQ_PAUSE:      ww_req_pause_free(&msg->u.pause); break;
-    case WW_REQ_MOUSE:      ww_req_mouse_free(&msg->u.mouse); break;
-    case WW_REQ_SET_FPS:    ww_req_set_fps_free(&msg->u.set_fps); break;
-    case WW_REQ_SHUTDOWN:   ww_req_shutdown_free(&msg->u.shutdown); break;
-    case WW_REQ_NEGOTIATE_BUFFERS:
-        ww_req_negotiate_buffers_free(&msg->u.negotiate_buffers);
+    case WW_EVT_IN_INIT:    ww_evt_in_init_free(&msg->u.init); break;
+    case WW_EVT_IN_SETTING_CHANGED:
+        ww_evt_in_setting_changed_free(&msg->u.setting_changed); break;
+    case WW_EVT_IN_PLAY:    ww_evt_in_play_free(&msg->u.play); break;
+    case WW_EVT_IN_PAUSE:   ww_evt_in_pause_free(&msg->u.pause); break;
+    case WW_EVT_IN_POINTER_MOTION:
+        ww_evt_in_pointer_motion_free(&msg->u.pointer_motion); break;
+    case WW_EVT_IN_POINTER_BUTTON:
+        ww_evt_in_pointer_button_free(&msg->u.pointer_button); break;
+    case WW_EVT_IN_POINTER_AXIS:
+        ww_evt_in_pointer_axis_free(&msg->u.pointer_axis); break;
+    case WW_EVT_IN_SET_FPS: ww_evt_in_set_fps_free(&msg->u.set_fps); break;
+    case WW_EVT_IN_SHUTDOWN:ww_evt_in_shutdown_free(&msg->u.shutdown); break;
+    case WW_EVT_IN_NEGOTIATE_BUFFERS:
+        ww_evt_in_negotiate_buffers_free(&msg->u.negotiate_buffers);
         break;
     default: break;
     }
@@ -523,12 +537,10 @@ int ww_bridge_negotiation_contains(const ww_negotiation_state_t *neg,
 
 void ww_bridge_negotiation_fill_format_caps(
     const ww_negotiation_state_t *neg,
-    uint32_t                      usage,
     uint32_t                     *scratch_fourccs,
     uint32_t                     *scratch_mod_counts,
     uint64_t                     *scratch_modifiers,
     uint32_t                     *scratch_plane_counts,
-    uint32_t                     *scratch_usages,
     ww_format_caps_caller_t      *out) {
     if (!neg || !out) return;
 
@@ -537,12 +549,11 @@ void ww_bridge_negotiation_fill_format_caps(
 
     /* Walk advertised, collapsing contiguous same-fourcc runs into
      * (fourccs[], mod_counts[]) and copying flat parallel arrays
-     * for modifiers/plane_counts/usages. */
+     * for modifiers/plane_counts. */
     for (uint32_t i = 0; i < n; ++i) {
         const ww_format_entry_t *e = &neg->advertised[i];
         scratch_modifiers[i]    = e->modifier;
         scratch_plane_counts[i] = e->plane_count;
-        scratch_usages[i]       = usage;
 
         if (fourcc_count == 0
             || scratch_fourccs[fourcc_count - 1] != e->fourcc) {
@@ -560,8 +571,149 @@ void ww_bridge_negotiation_fill_format_caps(
     out->mod_counts_count   = fourcc_count;
     out->modifiers          = scratch_modifiers;
     out->modifiers_count    = n;
-    out->usages             = scratch_usages;
-    out->usages_count       = n;
     out->plane_counts       = scratch_plane_counts;
     out->plane_counts_count = n;
+}
+
+
+/* -----------------------------------------------------------------------
+ * Init handshake (v4)
+ * ----------------------------------------------------------------------- */
+
+int ww_bridge_recv_init(int sock, ww_bridge_init_t *out) {
+    if (!out) return -EINVAL;
+    memset(out, 0, sizeof(*out));
+
+    ww_bridge_control_t ctl;
+    int rc = ww_bridge_recv_control(sock, &ctl);
+    if (rc != 0) return rc;
+
+    if (ctl.op != WW_EVT_IN_INIT) {
+        ww_bridge_control_free(&ctl);
+        return -EPROTO;
+    }
+
+    /* Transfer ownership of every heap allocation from the decoded
+     * `ww_evt_in_init_t` into the caller-facing `ww_bridge_init_t`.
+     * After this point the union is logically empty so calling
+     * `ww_bridge_control_free` on it would double-free; we skip it. */
+    out->spawn_version    = ctl.u.init.spawn_version;
+    out->extent_w         = ctl.u.init.extent_w;
+    out->extent_h         = ctl.u.init.extent_h;
+    out->extent_mode      = ctl.u.init.extent_mode;
+    out->settings         = ctl.u.init.settings;
+
+    /* Zero the union members we just stole so `ww_bridge_control_free`
+     * is safe even if a future refactor calls it. */
+    memset(&ctl.u.init, 0, sizeof(ctl.u.init));
+
+    if (out->spawn_version != WW_BRIDGE_SUPPORTED_SPAWN_VERSION) {
+        return -EPROTO;
+    }
+    return 0;
+}
+
+void ww_bridge_init_free(ww_bridge_init_t *out) {
+    if (!out) return;
+    /* `ww_kv_list_t` cleanup mirrors what the auto-generated
+     * `free_kv_list` does in ipc_v1.c — but that helper is `static`
+     * inside the generated TU. Replicate the freeing pattern locally
+     * (free key+value strings, then the `data` array). */
+    if (out->settings.data) {
+        for (uint32_t i = 0; i < out->settings.count; ++i) {
+            free(out->settings.data[i].key);
+            free(out->settings.data[i].value);
+        }
+        free(out->settings.data);
+    }
+    memset(out, 0, sizeof(*out));
+}
+
+int ww_bridge_send_init_nack(int sock,
+                             uint32_t received_spawn_version,
+                             uint32_t supported_spawn_version,
+                             const char *reason) {
+    ww_evt_init_nack_t m;
+    memset(&m, 0, sizeof(m));
+    m.received_spawn_version = received_spawn_version;
+    m.supported_spawn_version = supported_spawn_version;
+    /* Encoder doesn't mutate `reason`; cast away const-ness to fit
+     * the generated struct layout. NULL → empty string. */
+    m.reason = (char *)(reason ? reason : "");
+    WW_SEND_EVENT(sock, WW_EVT_INIT_NACK, ww_evt_init_nack_encode,
+                  &m, NULL, 0);
+}
+
+
+/* -----------------------------------------------------------------------
+ * setting_changed (hot-reload kv push)
+ * ----------------------------------------------------------------------- */
+
+int ww_bridge_setting_changed_from_control(ww_bridge_control_t *ctrl,
+                                           ww_bridge_setting_changed_t *out) {
+    if (!ctrl || !out) return -EINVAL;
+    if (ctrl->op != WW_EVT_IN_SETTING_CHANGED) return -EINVAL;
+    memset(out, 0, sizeof(*out));
+    /* Transfer ownership of the heap kv list. After this point
+     * `ctrl->u.setting_changed.settings` is empty so
+     * `ww_bridge_control_free(ctrl)` is a no-op for that arm. */
+    out->settings = ctrl->u.setting_changed.settings;
+    memset(&ctrl->u.setting_changed.settings, 0,
+           sizeof(ctrl->u.setting_changed.settings));
+    return 0;
+}
+
+void ww_bridge_setting_changed_free(ww_bridge_setting_changed_t *out) {
+    if (!out) return;
+    if (out->settings.data) {
+        for (uint32_t i = 0; i < out->settings.count; ++i) {
+            free(out->settings.data[i].key);
+            free(out->settings.data[i].value);
+        }
+        free(out->settings.data);
+    }
+    memset(out, 0, sizeof(*out));
+}
+
+
+/* -----------------------------------------------------------------------
+ * Pointer events
+ * ----------------------------------------------------------------------- */
+
+int ww_bridge_pointer_motion_from_control(ww_bridge_control_t *ctrl,
+                                          ww_bridge_pointer_motion_t *out) {
+    if (!ctrl || !out) return -EINVAL;
+    if (ctrl->op != WW_EVT_IN_POINTER_MOTION) return -EINVAL;
+    out->x            = ctrl->u.pointer_motion.x;
+    out->y            = ctrl->u.pointer_motion.y;
+    out->timestamp_us = ctrl->u.pointer_motion.timestamp_us;
+    out->modifiers    = ctrl->u.pointer_motion.modifiers;
+    return 0;
+}
+
+int ww_bridge_pointer_button_from_control(ww_bridge_control_t *ctrl,
+                                          ww_bridge_pointer_button_t *out) {
+    if (!ctrl || !out) return -EINVAL;
+    if (ctrl->op != WW_EVT_IN_POINTER_BUTTON) return -EINVAL;
+    out->x            = ctrl->u.pointer_button.x;
+    out->y            = ctrl->u.pointer_button.y;
+    out->button       = ctrl->u.pointer_button.button;
+    out->state        = ctrl->u.pointer_button.state;
+    out->timestamp_us = ctrl->u.pointer_button.timestamp_us;
+    out->modifiers    = ctrl->u.pointer_button.modifiers;
+    return 0;
+}
+
+int ww_bridge_pointer_axis_from_control(ww_bridge_control_t *ctrl,
+                                        ww_bridge_pointer_axis_t *out) {
+    if (!ctrl || !out) return -EINVAL;
+    if (ctrl->op != WW_EVT_IN_POINTER_AXIS) return -EINVAL;
+    out->x            = ctrl->u.pointer_axis.x;
+    out->y            = ctrl->u.pointer_axis.y;
+    out->delta_x      = ctrl->u.pointer_axis.delta_x;
+    out->delta_y      = ctrl->u.pointer_axis.delta_y;
+    out->source       = ctrl->u.pointer_axis.source;
+    out->timestamp_us = ctrl->u.pointer_axis.timestamp_us;
+    out->modifiers    = ctrl->u.pointer_axis.modifiers;
+    return 0;
 }

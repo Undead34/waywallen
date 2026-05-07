@@ -11,6 +11,15 @@
     client  = renderer subprocess (e.g. waywallen-renderer, open-wallpaper-engine
               host). Produces DMA-BUF frames and emits events back.
 
+  Direction taxonomy:
+    <event_in> — daemon → subprocess (inbound to the renderer). All
+                 control-plane notifications: init, setting_changed,
+                 play, pause, set_fps, shutdown, pointer_*,
+                 negotiate_buffers.
+    <event>    — subprocess → daemon (outbound from the renderer):
+                 ready, bind_buffers, frame_ready, error,
+                 release_syncobj, format_caps, bind_failed, init_nack.
+
   Wire format: identical framing to waywallen-display-v1 (Wayland-style
   binary):
 
@@ -55,93 +64,161 @@
       `release_syncobj@release_point` before re-recording into the same
       `image_index`.
 
-  Version: 3
+  Surface (consolidated; pre-1.0, internal testing — no compat shims):
 
-  v2 (modifier negotiation):
-    - Renderer ships `format_caps` event after `ready` and before any
-      `bind_buffers`. Carries fourcc/modifier/usage/plane_count grids
-      plus device_uuid + sync_caps + color_caps + mem_hints. Daemon
-      pairs producer caps with consumer caps and picks a scheme.
-    - Daemon dispatches `negotiate_buffers` request — replacement for
-      `configure_buffers` — telling the renderer exactly which fourcc,
-      modifier, plane_count, sync_mode, color_space, mem_hint, extent
-      and pool size to allocate. The renderer answers with a fresh
-      `bind_buffers` whose fourcc + modifier match.
-    - Renderer replies with `bind_failed` event when it cannot satisfy
-      a `negotiate_buffers` (e.g. allocator refuses the modifier on
-      this device); daemon blacklists that (fourcc, modifier) pair on
-      the renderer and re-runs the picker.
-    - `configure_buffers` is retained for the Iter 1+2 transition but
-      is dispatch-paused in the daemon; Iter 3 deletes it outright.
+    Spawn handshake (v4). Resource path + extras (assets, workshop_id,
+    …) ride on the renderer's CLI argv as `--<key> <value>` pairs the
+    daemon assembles from `source_plugin.extras(entry)`. Daemon then
+    sends `init` (opcode 1) immediately after accept(), carrying:
+    extent triple + the resolved L1 `[renderer.settings]` kv list
+    (fps / test_pattern / volume / loop_file / hwdec / render_node /
+    … all live as kv keys here, no typed scalars promoted). The
+    renderer answers with `ready`, or rejects with `init_nack`
+    (opcode 8) on `spawn_version` mismatch; the daemon kills the
+    child and surfaces the reason.
 
-  v3 (explicit path negotiation):
-    - `negotiate_buffers` carries `path` and `mem_source` — the daemon
-      now classifies GPU topology (same-device / same-vendor / cross
-      vendor) and selects an explicit allocation path. The bridge in
-      the renderer subprocess just executes the directive; no plugin
-      ever has to fall back to LINEAR on its own. `path` codes mirror
-      `ww_path_category` in <waywallen-bridge/pool.h>:
-        0 = OPTIMIZED_SAME_DEVICE  use the daemon-picked tile modifier
-        1 = OPTIMIZED_SAME_VENDOR  conservative modifier subset (Iter 2)
-        2 = COMPAT_LINEAR          force LINEAR; mem_source picks the source
-        3 = COMPAT_CPU_READBACK    Iter 3+, reserved
-      `mem_source` codes mirror `ww_mem_source`:
-        0 = GPU_NATIVE             GBM render-usage / VK DEVICE_LOCAL
-        1 = GPU_LINEAR             GBM_BO_USE_LINEAR / VK LINEAR exportable
-        2 = DMABUF_HEAP            /dev/dma_heap/* fallback
-    - `format_caps.mem_hints` adds bit 4 = LINEAR_ONLY: producer's own
-      modifier-aware probe failed entirely (e.g. NVIDIA proprietary
-      where every modifier is external_only); the daemon must pick a
-      COMPAT_LINEAR path regardless of consumer caps.
+    Hot reload. Daemon dispatches `setting_changed` (opcode 2) over a
+    live renderer's IPC whenever a non-identity setting in the
+    `[renderer.settings]` table changes (mpv `loop_file`/`hwdec`,
+    video `volume`, wescene `volume` / `fps`, …) instead of
+    respawning the child. The whole payload is a kv list of the
+    diff — fps is just one of those keys when the renderer's
+    manifest declares it. Pairs with the daemon-side identity-aware
+    `find_reusable`: a live renderer differing only on hot-reloadable
+    settings is reused via `setting_changed` rather than respawned.
+
+    Optional pointer events. `pointer_motion` / `pointer_button` /
+    `pointer_axis` are forwarded from the consumer display only when
+    the renderer's manifest opts in via `[renderer] events =
+    ["pointer"]`. Renderers that don't subscribe never see them.
+    Field shapes mirror waywallen-display-v1's pointer events; the
+    daemon is a pure passthrough that strips its display id.
+
+    Modifier negotiation. The renderer ships `format_caps` after
+    `ready` and before any `bind_buffers`, advertising
+    fourcc/modifier/usage/plane_count grids plus device_uuid,
+    sync_caps, color_caps, and mem_hints. The daemon pairs producer
+    caps with consumer caps and answers with `negotiate_buffers`
+    naming the chosen fourcc, modifier, plane_count, sync_mode,
+    color_space, mem_hint, extent, and pool size. The renderer
+    replies with a fresh `bind_buffers` whose fourcc+modifier match;
+    on allocator refusal it emits `bind_failed`, the daemon
+    blacklists that (fourcc, modifier) pair on this renderer, and
+    the picker re-runs.
+
+    Explicit allocation path. `negotiate_buffers` carries `path` and
+    `mem_source`: the daemon classifies GPU topology (same-device /
+    same-vendor / cross-vendor) and tells the bridge exactly which
+    allocation strategy to take — no plugin ever has to fall back to
+    LINEAR on its own. Codes mirror `ww_path_category` and
+    `ww_mem_source` in <waywallen-bridge/pool.h>:
+      path: 0=OPTIMIZED_SAME_DEVICE  daemon-picked tile modifier
+            1=OPTIMIZED_SAME_VENDOR  conservative modifier subset
+            2=COMPAT_LINEAR          force LINEAR; mem_source picks source
+            3=COMPAT_CPU_READBACK    reserved
+      mem:  0=GPU_NATIVE             GBM render-usage / VK DEVICE_LOCAL
+            1=GPU_LINEAR             GBM_BO_USE_LINEAR / VK LINEAR exportable
+            2=DMABUF_HEAP            /dev/dma_heap/* fallback
+    `format_caps.mem_hints` bit 4 = LINEAR_ONLY signals that the
+    producer's modifier-aware probe failed entirely (e.g. NVIDIA
+    proprietary where every modifier is external_only), forcing the
+    daemon to pick a COMPAT_LINEAR path regardless of consumer caps.
+
+  Version: 1 (file); spawn payload = SPAWN_VERSION 4
 -->
-<protocol name="waywallen_ipc" version="3">
+<protocol name="waywallen_ipc" version="1">
 
   <!-- ==================================================================
-       REQUESTS  (daemon -> subprocess, control plane)
+       INBOUND EVENTS  (daemon -> subprocess, control plane)
        ================================================================== -->
 
   <!--
-    Opening handshake. In v1 this is not required on every connection
-    (the daemon currently spawns the subprocess and expects a `ready`
-    event without a preceding `hello`), but reserved for future
-    reconnect flows.
+    Spawn-time `init` (SPAWN_VERSION 4): typed payload sent by the
+    daemon immediately after accept(). Carries the minimum the
+    renderer needs to allocate its render target (extent triple) plus
+    the resolved L1 `[renderer.settings]` kv list. Resource path and
+    plugin-specific extras (assets, workshop_id, …) ride on the
+    renderer's CLI argv instead — the daemon constructs argv from
+    `source_plugin.extras(entry)` before fork+exec.
+
+    Fields:
+      `spawn_version` — protocol version of the Init payload itself.
+                        Renderer MUST send `init_nack` if it does not
+                        recognise the value. Current = 4.
+      `extent_w/h`    — pixel extent. `0` on either axis means
+                        "unspecified — renderer derives that axis
+                        from its content's intrinsic size".
+      `extent_mode`   — interpretation of `extent_w/h`:
+                        `0` = AS_GIVEN: 0-axis means native, both 0
+                              means fully native, both >0 means
+                              exact daemon-imposed size.
+                        `1` = FIT_SHORTER: shorter native axis is
+                              set to `max(extent_w, extent_h)`,
+                              other axis scaled to keep native aspect.
+      `settings`      — manifest-declared tunables, fully resolved
+                        (L1 = per-instance override || plugin default ||
+                        schema default). All scalar settings — `fps`,
+                        `test_pattern`, `volume`, `loop_file`, `hwdec`,
+                        `render_node`, … — live here as kv keys
+                        whenever the renderer's manifest declares
+                        them. No typed scalar promotion: the same kv
+                        shape is used in `setting_changed` for live
+                        diffs.
   -->
-  <request name="hello" opcode="1">
-    <arg name="client" type="string"/>
-    <arg name="version" type="u32"/>
-  </request>
+  <event_in name="init" opcode="1">
+    <arg name="spawn_version" type="u32"/>
+    <arg name="extent_w" type="u32"/>
+    <arg name="extent_h" type="u32"/>
+    <arg name="extent_mode" type="u32"/>
+    <arg name="settings" type="kv_list"/>
+  </event_in>
 
   <!--
-    Ask the subprocess to load a specific scene. Currently unused by
-    the Rust daemon (scene/assets are passed via CLI args at spawn
-    time) but the C++ host understands this message.
+    Setting-changed event: push a delta of `[renderer.settings]` to a
+    live renderer without respawning. Only `identity = false` settings
+    from the renderer's manifest are valid here (daemon-side
+    `find_reusable` filters before sending). All scalar settings,
+    including `fps` and `test_pattern`, ride as kv keys — same shape
+    as `init.settings`.
+
+    Renderer-side dispatch:
+      - mpv: `loop_file` / `hwdec` → `mpv_set_property` (mpv option
+        names use dashes, not underscores).
+      - image: warns when `settings` is non-empty (no hot-reloadable
+        knobs declared by the manifest).
+      - video: `loop_file` / `volume` / `fps`.
+      - wescene: `volume`, `fps`.
   -->
-  <request name="load_scene" opcode="2">
-    <arg name="pkg" type="string"/>
-    <arg name="assets" type="string"/>
+  <event_in name="setting_changed" opcode="2">
+    <arg name="settings" type="kv_list"/>
+  </event_in>
+
+  <event_in name="play" opcode="3"/>
+  <event_in name="pause" opcode="4"/>
+
+  <!--
+    Pointer motion. Optional inbound event; only delivered when the
+    renderer's manifest declares `events = ["pointer"]`. Field shapes
+    mirror waywallen-display-v1 `pointer_motion` (opcode 8) — the
+    daemon is a pure passthrough.
+  -->
+  <event_in name="pointer_motion" opcode="5">
+    <arg name="x" type="f32"/>
+    <arg name="y" type="f32"/>
+    <arg name="timestamp_us" type="u64"/>
+    <arg name="modifiers" type="u32"/>
+  </event_in>
+
+  <event_in name="set_fps" opcode="6">
     <arg name="fps" type="u32"/>
-    <arg name="width" type="u32"/>
-    <arg name="height" type="u32"/>
-  </request>
-
-  <request name="play" opcode="3"/>
-  <request name="pause" opcode="4"/>
-
-  <request name="mouse" opcode="5">
-    <arg name="x" type="f64"/>
-    <arg name="y" type="f64"/>
-  </request>
-
-  <request name="set_fps" opcode="6">
-    <arg name="fps" type="u32"/>
-  </request>
+  </event_in>
 
   <!--
     Request clean shutdown. The subprocess is expected to finish the
     current frame, tear down its Vulkan state, and exit. The daemon
     will SIGKILL if the process does not exit quickly.
   -->
-  <request name="shutdown" opcode="7"/>
+  <event_in name="shutdown" opcode="7"/>
 
   <!--
     Opcode 8 was `configure_buffers` in v1; v2 deletes it in favor of
@@ -151,12 +228,20 @@
   <!--
     Modifier-negotiation v2 — replaces the deleted `configure_buffers`. The
     daemon ships exactly the (fourcc, modifier, plane_count, sync_mode,
-    color, mem_hint, extent, count) tuple it picked from the producer ∩
+    color, mem_hint, count) tuple it picked from the producer ∩
     consumer caps intersection. The renderer answers with a fresh
     `bind_buffers` whose fourcc + modifier match (and a strictly
     increasing `generation`). On failure the renderer sends
     `bind_failed` (opcode 7); the daemon then blacklists the
     (fourcc, modifier) pair on this renderer and tries again.
+
+    Render-target extent is intentionally NOT a negotiation field.
+    The renderer is the producer and already resolved its render
+    extent from `Init.{extent_w,extent_h,extent_mode}` against its
+    content's intrinsic size; that's what `advertise_caps` carries.
+    The bridge sizes its dmabuf slots from that, then `bind_buffers`
+    reports the actual buffer dims back to the daemon for the
+    consumer side.
 
     Field meanings:
       `fourcc`        — DRM_FORMAT_* (canonical: ABGR8888 = 'AB24' = 0x34324241).
@@ -165,7 +250,6 @@
       `sync_mode`     — see `format_caps.sync_caps` bits below; exactly one bit.
       `color`         — packed encoding/range/alpha; see `format_caps.color_caps`.
       `mem_hint`      — bitfield: same bits as `format_caps.mem_hints`.
-      `extent_w/h`    — pixel extent of each buffer.
       `count`         — pool size (number of buffers in the swapchain).
       `path`          — v3, see `ww_path_category` codes in the v3 doc
                         block above. Bridge dispatches its allocation
@@ -173,19 +257,45 @@
       `mem_source`    — v3, see `ww_mem_source` codes. Picks the
                         underlying memory backend for COMPAT_LINEAR.
   -->
-  <request name="negotiate_buffers" opcode="9">
+  <event_in name="negotiate_buffers" opcode="9">
     <arg name="fourcc" type="u32"/>
     <arg name="modifier" type="u64"/>
     <arg name="plane_count" type="u32"/>
     <arg name="sync_mode" type="u32"/>
     <arg name="color" type="u32"/>
     <arg name="mem_hint" type="u32"/>
-    <arg name="extent_w" type="u32"/>
-    <arg name="extent_h" type="u32"/>
     <arg name="count" type="u32"/>
     <arg name="path" type="u32"/>
     <arg name="mem_source" type="u32"/>
-  </request>
+  </event_in>
+
+  <!--
+    Pointer button. Optional; gated by manifest `events = ["pointer"]`.
+    Mirrors waywallen-display-v1 `pointer_button` (opcode 9).
+  -->
+  <event_in name="pointer_button" opcode="10">
+    <arg name="x" type="f32"/>
+    <arg name="y" type="f32"/>
+    <arg name="button" type="u32"/>
+    <arg name="state" type="u32"/>
+    <arg name="timestamp_us" type="u64"/>
+    <arg name="modifiers" type="u32"/>
+  </event_in>
+
+  <!--
+    Pointer axis (scroll). Optional; gated by manifest `events =
+    ["pointer"]`. Mirrors waywallen-display-v1 `pointer_axis`
+    (opcode 10).
+  -->
+  <event_in name="pointer_axis" opcode="11">
+    <arg name="x" type="f32"/>
+    <arg name="y" type="f32"/>
+    <arg name="delta_x" type="f32"/>
+    <arg name="delta_y" type="f32"/>
+    <arg name="source" type="u32"/>
+    <arg name="timestamp_us" type="u64"/>
+    <arg name="modifiers" type="u32"/>
+  </event_in>
 
 
   <!-- ==================================================================
@@ -300,25 +410,23 @@
     Encoding:
       Parallel arrays. `fourccs[i]` advertises a DRM format the
       producer can allocate; `mod_counts[i]` is the number of modifiers
-      it supports for that format. Modifiers/usages/plane_counts are
+      it supports for that format. Modifiers/plane_counts are
       flattened fourcc-major:
 
         modifiers[ sum(mod_counts[0..i]) .. +mod_counts[i] ]
-        usages[    same range ]
         plane_counts[ same range ]
 
-      Validation: modifiers.len == usages.len == plane_counts.len ==
+      Validation: modifiers.len == plane_counts.len ==
       sum(mod_counts).
 
+      Each peer locally filters its advertised modifier list by the
+      `VkFormatFeatureFlags` it actually needs (producer: write-side
+      features such as TRANSFER_DST + BLIT_DST or STORAGE_IMAGE;
+      consumer: SAMPLED + TRANSFER_SRC). Only the surviving modifiers
+      hit the wire — the daemon picks intersection without reading
+      any usage/feature hint.
+
     Bit definitions (mirrored across producer + consumer caps):
-      `usage` per (fourcc, modifier):
-        bit 0 = SAMPLED               can be sampled from a shader
-        bit 1 = STORAGE               GPU storage image
-        bit 2 = COLOR_ATTACHMENT      can be rendered into
-        bit 3 = DEPTH_STENCIL         depth/stencil target
-        bit 4 = TRANSFER_SRC          blit source
-        bit 5 = TRANSFER_DST          blit destination
-        bit 6 = SCANOUT               can be directly scanned out by KMS
       `mem_hints`:
         bit 0 = DEVICE_LOCAL          producer prefers VRAM placement
         bit 1 = HOST_VISIBLE          producer can also do GTT/system
@@ -348,7 +456,6 @@
     <arg name="fourccs" type="array" element="u32"/>
     <arg name="mod_counts" type="array" element="u32"/>
     <arg name="modifiers" type="array" element="u64"/>
-    <arg name="usages" type="array" element="u32"/>
     <arg name="plane_counts" type="array" element="u32"/>
     <arg name="device_uuid" type="array" element="u32"/>
     <arg name="driver_uuid" type="array" element="u32"/>
@@ -378,6 +485,27 @@
     <arg name="modifier" type="u64"/>
     <arg name="reason" type="u32"/>
     <arg name="message" type="string"/>
+  </event>
+
+  <!--
+    Reject the daemon's `init` request (v4). Renderer emits this
+    instead of `ready` when it cannot honour the spawn payload —
+    the canonical case being `spawn_version` mismatch, but also
+    used for unknown `resource_kind`, malformed plugin_settings,
+    etc. The daemon kills the child and surfaces `reason` to the
+    caller of `RendererManager::spawn`.
+
+    Fields:
+      `received_spawn_version`  — value the renderer saw on the wire
+                                  (0 if the field was missing /
+                                  truncated).
+      `supported_spawn_version` — what the renderer can handle.
+      `reason`                  — human-readable explanation.
+  -->
+  <event name="init_nack" opcode="8">
+    <arg name="received_spawn_version" type="u32"/>
+    <arg name="supported_spawn_version" type="u32"/>
+    <arg name="reason" type="string"/>
   </event>
 
 </protocol>

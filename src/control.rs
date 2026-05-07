@@ -11,19 +11,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 
+use crate::error::{Error, Result};
 use crate::ipc::proto::ControlMsg;
 use crate::model::{repo, sync};
-use crate::playlist::rotator::RotationConfig;
-use crate::playlist::Mode;
+use crate::queue::rotator::RotationConfig;
+use crate::queue::Mode;
 use crate::renderer_manager;
 use crate::wallpaper_type::WallpaperEntry;
 use crate::AppState;
 
-/// Re-export so callers that already wrote `control::PlaylistState`
+/// Re-export so callers that already wrote `control::QueueState`
 /// don't have to chase the move into the `playlist` module.
-pub use crate::playlist::PlaylistState;
+pub use crate::queue::QueueState;
 
 pub struct ApplyResult {
     pub renderer_id: String,
@@ -45,7 +46,6 @@ pub async fn apply_wallpaper_by_id(
     id: &str,
     width: u32,
     height: u32,
-    fps: u32,
 ) -> Result<ApplyResult> {
     let app_clone = app.clone();
     let id_owned = id.to_string();
@@ -55,7 +55,7 @@ pub async fn apply_wallpaper_by_id(
         "apply/global",
         format!("apply/{id_owned}"),
         async move {
-            let res = apply_wallpaper_inner(&app_clone, &id_owned, width, height, fps).await;
+            let res = apply_wallpaper_inner(&app_clone, &id_owned, width, height).await;
             // If the receiver is gone the caller already moved on (or
             // was itself cancelled); silently drop the result.
             let _ = tx.send(res);
@@ -63,7 +63,7 @@ pub async fn apply_wallpaper_by_id(
         },
     );
     rx.await
-        .map_err(|_| anyhow!("apply task superseded or cancelled"))?
+        .map_err(|_| Error::Internal(anyhow!("apply task superseded or cancelled")))?
 }
 
 /// The actual apply work — spawn renderer, relink displays, kill old
@@ -73,52 +73,94 @@ async fn apply_wallpaper_inner(
     id: &str,
     width: u32,
     height: u32,
-    fps: u32,
 ) -> Result<ApplyResult> {
     let entry = {
         let snap = app.source_snapshot.read().await;
         snap.get(id).cloned()
     };
-    let entry = entry.ok_or_else(|| anyhow!("wallpaper '{id}' not found"))?;
+    let entry = entry.ok_or_else(|| Error::WallpaperNotFound(id.to_string()))?;
 
-    if app
+    let renderer_plugin_name = app
         .renderer_manager
         .registry()
         .resolve(&entry.wp_type)
-        .is_none()
-    {
-        return Err(anyhow!("no renderer for wallpaper type '{}'", entry.wp_type));
+        .map(|def| def.name.clone())
+        .ok_or_else(|| Error::NoRendererForType(entry.wp_type.clone()))?;
+
+    // The D-Bus + rotator entry point always relinks every display
+    // to the new renderer (relink_all_displays_to below). That means
+    // every pre-existing renderer ends up with zero enabled links. We
+    // stop them *before* spawning the new one so peak VRAM stays at
+    // one renderer's working set instead of overlapping two.
+    let to_stop = app.router.renderers_fully_replaced_by(None).await;
+    if !to_stop.is_empty() {
+        app.router.stop_renderers(&to_stop).await;
     }
 
-    let pre_existing: Vec<String> = app.renderer_manager.list().await;
-
-    let width = if width == 0 { 1920 } else { width };
-    let height = if height == 0 { 1080 } else { height };
-    let fps = if fps == 0 { 30 } else { fps };
+    // `width`/`height` of `0` are legal — they tell the renderer to
+    // derive that axis from the wallpaper's intrinsic size.
+    // SPAWN_VERSION 3: source plugin's `extras(entry)` Lua callback
+    // returns the CLI argv dict. Lua failures used to fall back to
+    // `entry.metadata` silently; now they surface as
+    // `SourceExtrasFailed` so the dbus / rotator caller learns the
+    // real problem instead of getting a confusing "wrong settings"
+    // follow-up — same policy as the WS apply path.
+    let extras = app
+        .source_manager
+        .lock()
+        .await
+        .call_extras(&entry.plugin_name, &entry)
+        .await?;
+    // Init.settings is the reconciled per-plugin section of the
+    // settings store; defaults and bound-checks are already enforced
+    // there (`Settings::reconcile` on startup, `coerce_and_validate`
+    // on `SettingsSet`). The D-Bus / scheduler / rotator entry points
+    // don't take per-call setting overrides, so this is the canonical
+    // source.
+    let spawn_settings = app
+        .settings
+        .plugin(&renderer_plugin_name)
+        .unwrap_or_default();
     let spawn_req = renderer_manager::SpawnRequest {
         wp_type: entry.wp_type.clone(),
-        metadata: entry.metadata.clone(),
+        extras,
+        settings: spawn_settings,
         width,
         height,
-        fps,
+        extent_mode: crate::settings::extent_mode::AS_GIVEN,
         test_pattern: false,
+        renderer_name: None,
     };
-    let renderer_id = app.renderer_manager.spawn(spawn_req).await?;
+    // renderer_manager still returns anyhow today (Phase 3 will give
+    // it typed Error). The blanket `From<anyhow::Error>` lands this in
+    // `Error::Internal`; once Phase 3 ships, the typed
+    // `RendererSpawnFailed` will flow through automatically.
+    let renderer_id = app
+        .renderer_manager
+        .spawn(spawn_req)
+        .await
+        .map_err(|e| Error::RendererSpawnFailed(e.to_string()))?;
     if let Some(handle) = app.renderer_manager.get(&renderer_id).await {
         app.router.register_renderer(handle).await;
     }
     app.router.relink_all_displays_to(&renderer_id).await;
-    for old_id in pre_existing {
-        if old_id != renderer_id {
-            app.router.unregister_renderer(&old_id).await;
-            let _ = app.renderer_manager.kill(&old_id).await;
-        }
-    }
 
     {
-        let mut playlist = app.playlist.lock().await;
-        playlist.locate(&entry.id);
-        playlist.current = Some(entry.id.clone());
+        let mut q = app.queue.lock().await;
+        q.current = Some(entry.id.clone());
+        // Stash the DB id so sequential / random stepping has an anchor.
+        // Best-effort: lookup may fail if sync hasn't picked the entry up.
+        if !entry.library_root.is_empty() {
+            if let Some(rel) =
+                crate::queue::relative_under_root(&entry.library_root, &entry.resource)
+            {
+                if let Ok(Some(it)) =
+                    repo::find_item_by_library_path(&app.db, &entry.library_root, &rel).await
+                {
+                    q.last_db_id = Some(it.id);
+                }
+            }
+        }
     }
 
     app.settings.update(|s| {
@@ -130,54 +172,143 @@ async fn apply_wallpaper_inner(
     // the value the next start needs to reproduce playback. flush_now
     // is a cheap no-op when nothing actually changed.
     app.settings.flush_now().await;
+    crate::dbus_iface::notify_current_wallpaper_id_changed(app).await;
 
     Ok(ApplyResult { renderer_id, entry })
 }
 
-/// Advance the playlist cursor by `delta` and apply the result.
+/// Advance the queue cursor by `delta` and apply the result.
 ///
-/// For the "All" pseudo-playlist (`active_id = None`) and curated
-/// playlists where membership is already cached on the state, this is
-/// a thin step over the in-memory cursor. Smart playlists also work
-/// here as long as `refresh_sources` has populated `ids` from the
-/// filter; the rotator (P5) calls this on every interval tick.
+/// Sequential / Random go straight to the DB via the active filter
+/// (`settings.global.wallpaper_filter`). Shuffle materializes a round
+/// of matching DB ids on first entry / wrap, then walks it in memory.
+/// The rotator (rotation tick) calls this with `delta = 1`.
 pub async fn step(app: &Arc<AppState>, delta: i32) -> Result<String> {
-    // For All, refresh from source on every step so newly-imported
-    // wallpapers join the rotation without waiting for an explicit
-    // rescan. For curated/smart playlists, ids are already pinned —
-    // do not regenerate them here.
-    let next_id = {
-        let mut playlist = app.playlist.lock().await;
-        if playlist.active_id.is_none() {
-            let snapshot: Vec<String> = {
-                let snap = app.source_snapshot.read().await;
-                snap.list().iter().map(|e| e.id.clone()).collect()
+    use crate::model::repo::{StepDirection, QueueRow};
+    use crate::queue::Mode;
+
+    let (filters, logics) = app.settings.global().wallpaper_filter.to_pb();
+    let mode = app.queue.lock().await.mode;
+
+    let row: QueueRow = match mode {
+        Mode::Sequential => {
+            let after = app.queue.lock().await.last_db_id;
+            let dir = if delta >= 0 {
+                StepDirection::Forward
+            } else {
+                StepDirection::Backward
             };
-            playlist.refresh(snapshot);
+            repo::next_item_by_filter(&app.db, &filters, &logics, after, dir)
+                .await?
+                .ok_or_else(|| Error::FailedPrecondition("queue is empty".into()))?
         }
-        if playlist.ids.is_empty() {
-            return Err(anyhow!("playlist is empty"));
+        Mode::Random => {
+            let exclude = app.queue.lock().await.last_db_id;
+            repo::random_item_by_filter(&app.db, &filters, &logics, exclude)
+                .await?
+                .ok_or_else(|| Error::FailedPrecondition("queue is empty".into()))?
         }
-        playlist
-            .step(delta)
-            .ok_or_else(|| anyhow!("playlist is empty"))?
+        Mode::Shuffle => step_shuffle(app, &filters, &logics, delta).await?,
     };
-    apply_wallpaper_by_id(app, &next_id, 0, 0, 0).await?;
+
+    let entry_id = bridge_to_entry_id(app, &row).await?;
+    apply_wallpaper_by_id(app, &entry_id, 0, 0).await?;
     // Reset the rotator deadline so the user gets the full quiet
     // window after a manual advance instead of being walked over by
     // the next auto tick.
     app.rotation.kick();
-    Ok(next_id)
+    Ok(entry_id)
+}
+
+/// Bridge a DB row to a snapshot entry id (the `WallpaperApply`
+/// argument). Returns `Error::WallpaperNotFound` if the snapshot
+/// hasn't picked the row up yet (sync just ran but scan hasn't).
+async fn bridge_to_entry_id(app: &Arc<AppState>, row: &repo::QueueRow) -> Result<String> {
+    let snap = app.source_snapshot.read().await;
+    for entry in snap.list() {
+        if entry.library_root.is_empty() {
+            continue;
+        }
+        let rel = match crate::queue::relative_under_root(&entry.library_root, &entry.resource) {
+            Some(r) => r,
+            None => continue,
+        };
+        if entry.library_root.trim_end_matches('/') == row.library_path.trim_end_matches('/')
+            && rel == row.item_path
+        {
+            return Ok(entry.id.clone());
+        }
+    }
+    Err(Error::WallpaperNotFound(format!(
+        "{} / {}",
+        row.library_path, row.item_path
+    )))
+}
+
+async fn step_shuffle(
+    app: &Arc<AppState>,
+    filters: &[crate::control_proto::WallpaperFilterRule],
+    logics: &[crate::control_proto::FilterLogic],
+    delta: i32,
+) -> Result<repo::QueueRow> {
+    // Lock-free preflight: snapshot whether the round is empty so we
+    // can fetch ids without holding the queue mutex through the DB call.
+    let need_round = {
+        let q = app.queue.lock().await;
+        q.shuffle_round.is_empty()
+    };
+    if need_round {
+        let ids = repo::list_item_ids_by_filter(&app.db, filters, logics).await?;
+        if ids.is_empty() {
+            return Err(Error::FailedPrecondition("queue is empty".into()));
+        }
+        let mut q = app.queue.lock().await;
+        let avoid = q.last_db_id;
+        q.build_shuffle_round(ids, avoid, 0);
+        let pick = q.shuffle_round[0];
+        q.shuffle_pos = 0;
+        drop(q);
+        return repo::get_item_with_library(&app.db, pick)
+            .await?
+            .ok_or_else(|| Error::FailedPrecondition("queue is empty".into()));
+    }
+
+    let pick = {
+        let mut q = app.queue.lock().await;
+        let len = q.shuffle_round.len() as i64;
+        let raw = q.shuffle_pos as i64 + delta as i64;
+        if raw >= len || raw < 0 {
+            // Wrap: rebuild the round.
+            let avoid = q.last_db_id;
+            let target = if raw >= len {
+                0usize
+            } else {
+                q.shuffle_round.len().saturating_sub(1)
+            };
+            let candidates = q.shuffle_round.clone();
+            q.build_shuffle_round(candidates, avoid, target);
+            q.shuffle_pos = target;
+        } else {
+            q.shuffle_pos = raw as usize;
+        }
+        q.shuffle_round[q.shuffle_pos]
+    };
+
+    repo::get_item_with_library(&app.db, pick)
+        .await?
+        .ok_or_else(|| Error::FailedPrecondition("queue is empty".into()))
 }
 
 /// Set the rotation mode on the active playlist. Pure in-memory; the
 /// caller is responsible for persistence (settings + DB) when the
 /// active playlist is a real DB row.
 pub async fn set_mode(app: &Arc<AppState>, mode: Mode) {
-    app.playlist.lock().await.set_mode(mode);
+    app.queue.lock().await.set_mode(mode);
     app.settings.update(|s| {
-        s.global.playlist_mode = mode.as_str().to_owned();
+        s.global.queue_mode = mode.as_str().to_owned();
     });
+    crate::dbus_iface::notify_queue_mode_changed(app).await;
+    crate::tray::dbusmenu::notify_menu_changed(app).await;
 }
 
 /// Set the auto-rotation interval (seconds; `0` disables). Updates
@@ -188,6 +319,8 @@ pub async fn set_rotation_interval(app: &Arc<AppState>, secs: u32) {
     app.settings.update(|s| {
         s.global.rotation_secs = secs;
     });
+    crate::dbus_iface::notify_rotation_secs_changed(app).await;
+    crate::tray::dbusmenu::notify_menu_changed(app).await;
 }
 
 /// Convenience: flip shuffle on/off without exposing the [`Mode`]
@@ -197,50 +330,9 @@ pub async fn set_shuffle(app: &Arc<AppState>, on: bool) {
     set_mode(app, mode).await;
 }
 
-/// Summary row used by `ListPlaylists`. Stays string-typed so the
-/// D-Bus signature `a(isxs)` (id, name, source_kind, item_count)
-/// stays human-readable.
-#[derive(Debug, Clone)]
-pub struct PlaylistSummary {
-    pub id: i64,
-    pub name: String,
-    pub source_kind: String,
-    pub mode: String,
-    pub interval_secs: i32,
-    pub item_count: u32,
-}
-
-pub async fn list_playlists(app: &Arc<AppState>) -> Result<Vec<PlaylistSummary>> {
-    let rows = repo::list_playlists(&app.db).await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        // Curated count = playlist_item rows. Smart count is left at
-        // 0 here since computing it would require resolving against
-        // the snapshot — `PlaylistStatus` (active playlist only) is
-        // the right place for that, not a list summary.
-        let item_count = if r.source_kind == repo::PLAYLIST_KIND_CURATED {
-            repo::list_playlist_item_ids(&app.db, r.id)
-                .await
-                .unwrap_or_default()
-                .len() as u32
-        } else {
-            0
-        };
-        out.push(PlaylistSummary {
-            id: r.id,
-            name: r.name,
-            source_kind: r.source_kind,
-            mode: r.mode,
-            interval_secs: r.interval_secs,
-            item_count,
-        });
-    }
-    Ok(out)
-}
-
 /// Snapshot of the live playlist state for status reporting.
 #[derive(Debug, Clone)]
-pub struct PlaylistStatus {
+pub struct QueueStatus {
     pub active_id: Option<i64>,
     pub mode: String,
     pub interval_secs: u32,
@@ -250,61 +342,24 @@ pub struct PlaylistStatus {
     pub is_smart: bool,
 }
 
-pub async fn playlist_status(app: &Arc<AppState>) -> PlaylistStatus {
-    let g = app.playlist.lock().await;
-    PlaylistStatus {
-        active_id: g.active_id,
+pub async fn queue_status(app: &Arc<AppState>) -> QueueStatus {
+    let (filters, logics) = app.settings.global().wallpaper_filter.to_pb();
+    let count = repo::count_items_by_filter(&app.db, &filters, &logics)
+        .await
+        .unwrap_or(0) as u32;
+    let g = app.queue.lock().await;
+    QueueStatus {
+        active_id: None,
         mode: g.mode.as_str().to_owned(),
         interval_secs: app.rotation.interval(),
         current: g.current.clone(),
-        position: g.position().map(|p| p as u32),
-        count: g.count() as u32,
-        is_smart: g.filter.is_some(),
+        position: None,
+        count,
+        is_smart: !filters.is_empty(),
     }
 }
 
-/// Activate a persisted playlist. Loads its row, installs the
-/// associated mode/filter/seed, and resolves member ids against the
-/// current source-manager snapshot. After this returns, `step()`
-/// walks the activated playlist instead of the All pseudo-list.
-/// Persists `active_playlist_id` to settings so a daemon restart
-/// re-enters the same playlist.
-pub async fn activate_playlist(app: &Arc<AppState>, id: i64) -> Result<()> {
-    let snapshot: Vec<WallpaperEntry> = {
-        let snap = app.source_snapshot.read().await;
-        snap.list().to_vec()
-    };
-    {
-        let mut state = app.playlist.lock().await;
-        crate::playlist::resolve::activate(&app.db, &snapshot, &mut state, id).await?;
-    }
-    app.settings.update(|s| {
-        s.global.active_playlist_id = Some(id);
-    });
-    Ok(())
-}
-
-/// Switch back to the All pseudo-playlist. Membership is recomputed
-/// against the current snapshot so the cursor stays usable
-/// immediately, no rescan required.
-pub async fn deactivate_playlist(app: &Arc<AppState>) -> Result<()> {
-    let snapshot: Vec<WallpaperEntry> = {
-        let snap = app.source_snapshot.read().await;
-        snap.list().to_vec()
-    };
-    {
-        let mut state = app.playlist.lock().await;
-        crate::playlist::resolve::deactivate(&mut state);
-        let ids: Vec<String> = snapshot.iter().map(|e| e.id.clone()).collect();
-        state.refresh(ids);
-    }
-    app.settings.update(|s| {
-        s.global.active_playlist_id = None;
-    });
-    Ok(())
-}
-
-/// Restore the persisted wallpaper + playlist state. Idempotent —
+/// Restore the persisted wallpaper + queue state. Idempotent —
 /// callable on demand if a future feature wants to "re-load saved
 /// state" without a full daemon restart. Publishes `RestoreApplied`
 /// or `RestoreFailed` on the global event bus on completion so
@@ -317,7 +372,7 @@ pub async fn run_restore(app: &Arc<AppState>, restore_last: bool) -> Result<()> 
     if restore_last {
         if let Some(last_id) = app.settings.global().last_wallpaper.clone() {
             log::info!("restoring last wallpaper: {last_id}");
-            match apply_wallpaper_by_id(app, &last_id, 0, 0, 0).await {
+            match apply_wallpaper_by_id(app, &last_id, 0, 0).await {
                 Ok(_) => applied = Some(last_id),
                 Err(e) => {
                     log::warn!("failed to restore last wallpaper: {e:#}");
@@ -328,20 +383,9 @@ pub async fn run_restore(app: &Arc<AppState>, restore_last: bool) -> Result<()> 
         }
     }
 
-    // Order matters: activate (which sets mode/seed from the DB row)
-    // BEFORE applying the saved in-memory mode preference, so the
-    // user's last All-pseudo-list mode wins when there's no DB row to
-    // override.
     let g = app.settings.global();
-    if let Some(pl_id) = g.active_playlist_id {
-        if let Err(e) = activate_playlist(app, pl_id).await {
-            log::warn!("failed to activate playlist id={pl_id}: {e:#}");
-            app.events
-                .publish(GlobalEvent::RestoreFailed(format!("activate: {e:#}")));
-        }
-    }
-    if let Some(mode) = crate::playlist::Mode::from_str(&g.playlist_mode) {
-        app.playlist.lock().await.set_mode(mode);
+    if let Some(mode) = crate::queue::Mode::from_str(&g.queue_mode) {
+        app.queue.lock().await.set_mode(mode);
     }
     if g.rotation_secs > 0 {
         app.rotation.set_interval(g.rotation_secs);
@@ -473,7 +517,7 @@ pub async fn auto_detect_libraries(
 
     let detected = {
         let sm = app.source_manager.lock().await;
-        sm.auto_detect_all()?
+        sm.auto_detect_all().await?
     };
     if detected.is_empty() {
         return Ok(Vec::new());
@@ -513,9 +557,10 @@ pub async fn auto_detect_libraries(
     }
 
     if !added.is_empty() {
-        app.events.publish(crate::events::GlobalEvent::LibrariesAdded {
-            paths: added.iter().map(|s| s.path.clone()).collect(),
-        });
+        app.events
+            .publish(crate::events::GlobalEvent::LibrariesAdded {
+                paths: added.iter().map(|s| s.path.clone()).collect(),
+            });
     }
 
     if !added.is_empty() {
@@ -571,7 +616,10 @@ pub async fn libraries_by_plugin_name(
     let libs = repo::list_libraries(db).await?;
     let mut by_plugin_id: HashMap<i64, Vec<String>> = HashMap::new();
     for lib in libs {
-        by_plugin_id.entry(lib.plugin_id).or_default().push(lib.path);
+        by_plugin_id
+            .entry(lib.plugin_id)
+            .or_default()
+            .push(lib.path);
     }
     let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
     for (pid, paths) in by_plugin_id {
@@ -590,8 +638,9 @@ pub async fn libraries_by_plugin_name(
 pub async fn refresh_sources(app: &Arc<AppState>) -> Result<usize> {
     use std::sync::atomic::Ordering;
     app.scan_in_progress.store(true, Ordering::SeqCst);
-    app.events.publish(crate::events::GlobalEvent::ScanStarted);
-    app.events.publish(crate::events::GlobalEvent::StatusChanged);
+    // Sync start is observable to UIs via `StatusSync.scan_in_progress`.
+    app.events
+        .publish(crate::events::GlobalEvent::StatusChanged);
 
     let result = refresh_sources_inner(app).await;
 
@@ -599,12 +648,13 @@ pub async fn refresh_sources(app: &Arc<AppState>) -> Result<usize> {
     match &result {
         Ok(count) => app
             .events
-            .publish(crate::events::GlobalEvent::ScanCompleted { count: *count }),
+            .publish(crate::events::GlobalEvent::SyncFinished { count: *count }),
         Err(e) => app
             .events
-            .publish(crate::events::GlobalEvent::ScanFailed(format!("{e:#}"))),
+            .publish(crate::events::GlobalEvent::SyncFailed(format!("{e:#}"))),
     }
-    app.events.publish(crate::events::GlobalEvent::StatusChanged);
+    app.events
+        .publish(crate::events::GlobalEvent::StatusChanged);
     result
 }
 
@@ -617,13 +667,21 @@ async fn refresh_sources_inner(app: &Arc<AppState>) -> Result<usize> {
     // itself. Read consumers (`WallpaperList`/`WallpaperApply`/
     // `SourceList`) go through `source_snapshot` instead and never park
     // behind this section.
+    //
+    // `scan_all` is async because Lua plugins can call mlua async
+    // functions (`ctx.library_meta_*`) that await sea-orm. We still
+    // run the scan inside `spawn_blocking` so the long CPU-bound
+    // filesystem walks don't block an async worker — `Handle::block_on`
+    // from inside `spawn_blocking` drives the async-Lua future to
+    // completion on this dedicated thread.
+    let handle = tokio::runtime::Handle::current();
     let snapshot: Vec<WallpaperEntry> = tokio::task::spawn_blocking(move || {
         let mut sm = source_mgr.blocking_lock();
-        sm.scan_all(&libs_for_scan)?;
+        handle.block_on(sm.scan_all(&libs_for_scan))?;
         Ok::<_, anyhow::Error>(sm.list().to_vec())
     })
     .await
-    .map_err(|e| anyhow!("source scan join: {e}"))??;
+    .map_err(|e| Error::Internal(anyhow!("source scan join: {e}")))??;
 
     let plugins = {
         let sm = app.source_manager.lock().await;
@@ -644,13 +702,13 @@ async fn refresh_sources_inner(app: &Arc<AppState>) -> Result<usize> {
             .filter(|e| e.plugin_name == info.name)
             .cloned()
             .collect();
-        let protected = libs_by_plugin
-            .get(&info.name)
-            .cloned()
-            .unwrap_or_default();
+        let protected = libs_by_plugin.get(&info.name).cloned().unwrap_or_default();
         match sync::sync_plugin_entries(
             &app.db,
-            sync::PluginRef { name: &info.name, version: &info.version },
+            sync::PluginRef {
+                name: &info.name,
+                version: &info.version,
+            },
             &entries,
             &protected,
         )
@@ -670,15 +728,11 @@ async fn refresh_sources_inner(app: &Arc<AppState>) -> Result<usize> {
     }
 
     let count = snapshot.len();
-    // Re-resolve the active playlist against the fresh snapshot. For
-    // the All pseudo-playlist this just clones the snapshot ids;
-    // smart playlists re-run their filter; curated playlists prune
-    // members that no longer exist on disk.
-    if let Err(e) =
-        crate::playlist::resolve::rebind_locked(&app.db, &snapshot, &app.playlist).await
-    {
-        log::warn!("playlist rebind after refresh failed: {e:#}");
-    }
+    // Queue plays dynamically from settings.wallpaper_filter; nothing
+    // to rebind after a sources refresh — the next `step()` will see
+    // the new DB rows. Invalidate any pre-built shuffle round so it's
+    // rematerialized including the freshly-imported items.
+    app.queue.lock().await.reset_shuffle_round();
 
     // Kick a one-shot probe drain so newly-imported items don't have
     // to wait for the next scheduler tick. `spawn_async_unique` collapses
@@ -693,9 +747,10 @@ async fn refresh_sources_inner(app: &Arc<AppState>) -> Result<usize> {
         async move {
             // run_pending emits its own info log; we only care about
             // surfacing the error here.
-            crate::probe_task::run_pending(&db, probe, crate::probe_task::PROBE_REFRESH_BATCH)
+            crate::probe::task::run_pending(&db, probe, crate::probe::task::PROBE_REFRESH_BATCH)
                 .await
                 .map(|_| ())
+                .map_err(anyhow::Error::from)
         },
     );
 

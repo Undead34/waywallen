@@ -25,8 +25,7 @@ It started life as a Wallpaper Engine plugin for KDE.
 
 ### Install
 
-**Flatpak**
-[org.waywallen.waywallen](https://github.com/hypengw/org.waywallen.waywallen)
+**Prebuilt binaries** — grab the latest archive from the [Releases page](https://github.com/waywallen/waywallen/releases).
 
 **From source** — see [BUILD.md](BUILD.md).
 
@@ -45,5 +44,13 @@ It started life as a Wallpaper Engine plugin for KDE.
 |------|--------|
 | Image wallpapers | ✅ |
 | Scene wallpapers | ✅ via [open-wallpaper-engine](https://github.com/waywallen/open-wallpaper-engine) |
-| Video wallpapers | ✅ via mpv |
-| Web wallpapers | ⚠️ planned |
+| Video wallpapers | ✅ |
+| Web wallpapers | ✅ via [open-wallpaper-engine](https://github.com/waywallen/open-wallpaper-engine) |
+
+## Configuration
+
+1. Open `System Settings` - `Wallpapers`
+2. Change `Wallpaper type` to `Waywallen` and ensure `Display module` is set to `Embedded`
+3. Launch `Waywallen` from the `Application Launcher` or run `waywallen` directly
+4. Add a `Source`. The default `Wallpaper Engine` data folder is located at `~/.local/share/Steam/steamapps/workshop/content/431960/`
+5. You should now be able to use dynamic wallpapers from `Wallpaper Engine`.

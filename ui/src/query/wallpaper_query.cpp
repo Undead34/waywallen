@@ -25,6 +25,7 @@ WallpaperListQuery::WallpaperListQuery(QObject* parent): QueryList(parent) {
     setLimit(60);
     tdata()->set_store(tdata(), AppStore::instance()->wallpapers);
     connect_requet_reload(&WallpaperListQuery::wpTypeChanged, this);
+    connect_requet_reload(&WallpaperListQuery::filterStateChanged, this);
 }
 
 auto WallpaperListQuery::wpType() const -> const QString& { return m_wp_type; }
@@ -34,6 +35,50 @@ void WallpaperListQuery::setWpType(const QString& v) {
         setOffset(0);
         Q_EMIT wpTypeChanged();
     }
+}
+
+auto WallpaperListQuery::filters() const -> const QList<control::v1::WallpaperFilterRule>& {
+    return m_filters;
+}
+
+void WallpaperListQuery::setFilters(const QList<control::v1::WallpaperFilterRule>& v) {
+    if (m_filters == v) return;
+    m_filters = v;
+    setOffset(0);
+    Q_EMIT filtersChanged();
+    Q_EMIT filterStateChanged();
+}
+
+auto WallpaperListQuery::filterLogics() const -> const QList<control::v1::FilterLogic>& {
+    return m_filter_logics;
+}
+
+void WallpaperListQuery::setFilterLogics(const QList<control::v1::FilterLogic>& v) {
+    if (m_filter_logics == v) return;
+    m_filter_logics = v;
+    setOffset(0);
+    Q_EMIT filterLogicsChanged();
+    Q_EMIT filterStateChanged();
+}
+
+bool WallpaperListQuery::replaceFilterState(
+    const QList<control::v1::WallpaperFilterRule>& filters,
+    const QList<control::v1::FilterLogic>& logics) {
+    const bool filters_changed = m_filters != filters;
+    const bool logics_changed = m_filter_logics != logics;
+    if (!filters_changed && !logics_changed) return false;
+
+    m_filters = filters;
+    m_filter_logics = logics;
+    setOffset(0);
+    if (filters_changed) Q_EMIT filtersChanged();
+    if (logics_changed) Q_EMIT filterLogicsChanged();
+    Q_EMIT filterStateChanged();
+    return true;
+}
+
+auto WallpaperListQuery::hasActiveFilters() const -> bool {
+    return !m_filters.isEmpty();
 }
 
 auto WallpaperListQuery::total() const -> qint32 { return m_total; }
@@ -47,6 +92,8 @@ void WallpaperListQuery::reload() {
     auto req   = proto::Request {};
     auto inner = proto::WallpaperListRequest {};
     inner.setWpType(m_wp_type);
+    inner.setFilters(m_filters);
+    inner.setFilterLogics(m_filter_logics);
     initReqForReload(inner);
     req.setWallpaperList(std::move(inner));
 
@@ -54,6 +101,7 @@ void WallpaperListQuery::reload() {
     spawn([self, backend, req = std::move(req)]() mutable -> task<void> {
         auto result = co_await backend->send(std::move(req));
         co_await asio::post(asio::bind_executor(self->get_executor(), use_task));
+        if (! self) co_return;
 
         self->inspect_set(result, [self](const proto::Response& rsp) {
             const auto&                   list_rsp = rsp.wallpaperList();
@@ -87,6 +135,8 @@ void WallpaperListQuery::fetchMore(qint32) {
     auto req   = proto::Request {};
     auto inner = proto::WallpaperListRequest {};
     inner.setWpType(m_wp_type);
+    inner.setFilters(m_filters);
+    inner.setFilterLogics(m_filter_logics);
     initReqForFetchMore(inner);
     req.setWallpaperList(std::move(inner));
 
@@ -95,6 +145,7 @@ void WallpaperListQuery::fetchMore(qint32) {
     spawn([self, backend, req = std::move(req), next_offset]() mutable -> task<void> {
         auto result = co_await backend->send(std::move(req));
         co_await asio::post(asio::bind_executor(self->get_executor(), use_task));
+        if (! self) co_return;
 
         self->inspect_set(result, [self, next_offset](const proto::Response& rsp) {
             const auto&                   list_rsp = rsp.wallpaperList();
@@ -139,6 +190,7 @@ void WallpaperScanQuery::reload() {
     spawn([self, backend, req = std::move(req)]() mutable -> task<void> {
         auto result = co_await backend->send(std::move(req));
         co_await asio::post(asio::bind_executor(self->get_executor(), use_task));
+        if (! self) co_return;
 
         self->inspect_set(result, [self](const proto::Response& rsp) {
             self->m_count = rsp.wallpaperScan().count();
@@ -170,6 +222,14 @@ void WallpaperApplyQuery::setDisplayIds(const QVariantList& v) {
     }
 }
 
+auto WallpaperApplyQuery::rendererName() const -> const QString& { return m_renderer_name; }
+void WallpaperApplyQuery::setRendererName(const QString& v) {
+    if (m_renderer_name != v) {
+        m_renderer_name = v;
+        Q_EMIT rendererNameChanged();
+    }
+}
+
 auto WallpaperApplyQuery::rendererId() const -> const QString& { return m_renderer_id; }
 
 void WallpaperApplyQuery::reload() {
@@ -191,12 +251,14 @@ void WallpaperApplyQuery::reload() {
         if (ok) ids.append(id);
     }
     inner.setDisplayIds(ids);
+    inner.setRendererName(m_renderer_name);
     req.setWallpaperApply(std::move(inner));
 
     auto self = QWatcher { this };
     spawn([self, backend, req = std::move(req)]() mutable -> task<void> {
         auto result = co_await backend->send(std::move(req));
         co_await asio::post(asio::bind_executor(self->get_executor(), use_task));
+        if (! self) co_return;
 
         self->inspect_set(result, [self](const proto::Response& rsp) {
             self->m_renderer_id = rsp.wallpaperApply().rendererId();

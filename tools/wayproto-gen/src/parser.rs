@@ -30,7 +30,10 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 fn err<T>(pos: usize, msg: impl Into<String>) -> Result<T, ParseError> {
-    Err(ParseError { pos, msg: msg.into() })
+    Err(ParseError {
+        pos,
+        msg: msg.into(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,10 +90,23 @@ pub struct Message {
     pub fds: FdSpec,
 }
 
+/// Naming style for the daemon→peer (inbound-to-peer) direction.
+/// `<request>` keeps Wayland-style naming (`Request` enum, `WW_REQ_*`,
+/// `ww_req_*_t`). `<event_in>` switches to the inbound-event taxonomy
+/// (`EventIn` enum, `WW_EVT_IN_*`, `ww_evt_in_*_t`) used by the
+/// waywallen-ipc protocol where the daemon notifies renderer
+/// subprocesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundKind {
+    Request,
+    EventIn,
+}
+
 #[derive(Debug, Clone)]
 pub struct Protocol {
     pub name: String,
     pub version: u32,
+    pub inbound_kind: InboundKind,
     pub requests: Vec<Message>,
     pub events: Vec<Message>,
 }
@@ -105,12 +121,18 @@ struct Node {
 
 impl Node {
     fn attr(&self, key: &str) -> Option<&str> {
-        self.attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+        self.attrs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
     }
 }
 
 pub fn parse_protocol(src: &str) -> Result<Protocol, ParseError> {
-    let mut p = Parser { src: src.as_bytes(), pos: 0 };
+    let mut p = Parser {
+        src: src.as_bytes(),
+        pos: 0,
+    };
     p.skip_prolog()?;
     let root = p.parse_element()?;
     if root.name != "protocol" {
@@ -118,37 +140,82 @@ pub fn parse_protocol(src: &str) -> Result<Protocol, ParseError> {
     }
     let name = root
         .attr("name")
-        .ok_or_else(|| ParseError { pos: 0, msg: "protocol missing name".into() })?
+        .ok_or_else(|| ParseError {
+            pos: 0,
+            msg: "protocol missing name".into(),
+        })?
         .to_string();
     let version: u32 = root
         .attr("version")
-        .ok_or_else(|| ParseError { pos: 0, msg: "protocol missing version".into() })?
+        .ok_or_else(|| ParseError {
+            pos: 0,
+            msg: "protocol missing version".into(),
+        })?
         .parse()
-        .map_err(|_| ParseError { pos: 0, msg: "protocol version not u32".into() })?;
+        .map_err(|_| ParseError {
+            pos: 0,
+            msg: "protocol version not u32".into(),
+        })?;
 
     let mut requests = Vec::new();
     let mut events = Vec::new();
+    let mut inbound_kind: Option<InboundKind> = None;
     for child in &root.children {
         match child.name.as_str() {
-            "request" => requests.push(parse_message(child)?),
+            "request" => {
+                set_inbound_kind(&mut inbound_kind, InboundKind::Request)?;
+                requests.push(parse_message(child)?);
+            }
+            "event_in" => {
+                set_inbound_kind(&mut inbound_kind, InboundKind::EventIn)?;
+                requests.push(parse_message(child)?);
+            }
             "event" => events.push(parse_message(child)?),
             other => return err(0, format!("unknown top-level element <{other}>")),
         }
     }
 
-    Ok(Protocol { name, version, requests, events })
+    Ok(Protocol {
+        name,
+        version,
+        inbound_kind: inbound_kind.unwrap_or(InboundKind::Request),
+        requests,
+        events,
+    })
+}
+
+fn set_inbound_kind(slot: &mut Option<InboundKind>, k: InboundKind) -> Result<(), ParseError> {
+    match *slot {
+        Some(prev) if prev != k => err(
+            0,
+            "protocol mixes <request> and <event_in>; pick exactly one",
+        ),
+        _ => {
+            *slot = Some(k);
+            Ok(())
+        }
+    }
 }
 
 fn parse_message(node: &Node) -> Result<Message, ParseError> {
     let name = node
         .attr("name")
-        .ok_or_else(|| ParseError { pos: 0, msg: format!("<{}> missing name", node.name) })?
+        .ok_or_else(|| ParseError {
+            pos: 0,
+            msg: format!("<{}> missing name", node.name),
+        })?
         .to_string();
     let opcode: u16 = node
         .attr("opcode")
-        .ok_or_else(|| ParseError { pos: 0, msg: format!("<{}> missing opcode", node.name) })?
+        .ok_or_else(|| ParseError {
+            pos: 0,
+            msg: format!("<{}> missing opcode", node.name),
+        })?
         .parse()
-        .map_err(|_| ParseError { pos: 0, msg: "opcode not u16".into() })?;
+        .map_err(|_| ParseError {
+            pos: 0,
+            msg: "opcode not u16".into(),
+        })?;
 
     let mut args = Vec::new();
     let mut fds = FdSpec::None;
@@ -159,17 +226,26 @@ fn parse_message(node: &Node) -> Result<Message, ParseError> {
             other => return err(0, format!("unknown message child <{other}>")),
         }
     }
-    Ok(Message { name, opcode, args, fds })
+    Ok(Message {
+        name,
+        opcode,
+        args,
+        fds,
+    })
 }
 
 fn parse_arg(node: &Node) -> Result<Arg, ParseError> {
     let name = node
         .attr("name")
-        .ok_or_else(|| ParseError { pos: 0, msg: "<arg> missing name".into() })?
+        .ok_or_else(|| ParseError {
+            pos: 0,
+            msg: "<arg> missing name".into(),
+        })?
         .to_string();
-    let ty_str = node
-        .attr("type")
-        .ok_or_else(|| ParseError { pos: 0, msg: "<arg> missing type".into() })?;
+    let ty_str = node.attr("type").ok_or_else(|| ParseError {
+        pos: 0,
+        msg: "<arg> missing type".into(),
+    })?;
     let ty = if ty_str == "array" {
         let elem_str = node.attr("element").ok_or_else(|| ParseError {
             pos: 0,
@@ -186,17 +262,20 @@ fn parse_arg(node: &Node) -> Result<Arg, ParseError> {
             _ => ArgType::Array(Box::new(elem)),
         }
     } else {
-        ArgType::parse(ty_str)
-            .ok_or_else(|| ParseError { pos: 0, msg: format!("unknown type {ty_str}") })?
+        ArgType::parse(ty_str).ok_or_else(|| ParseError {
+            pos: 0,
+            msg: format!("unknown type {ty_str}"),
+        })?
     };
     Ok(Arg { name, ty })
 }
 
 fn parse_fds(node: &Node) -> Result<FdSpec, ParseError> {
     if let Some(s) = node.attr("count") {
-        let n: u32 = s
-            .parse()
-            .map_err(|_| ParseError { pos: 0, msg: "fds count not u32".into() })?;
+        let n: u32 = s.parse().map_err(|_| ParseError {
+            pos: 0,
+            msg: "fds count not u32".into(),
+        })?;
         if n == 0 {
             Ok(FdSpec::None)
         } else {
@@ -303,7 +382,11 @@ impl<'a> Parser<'a> {
                     return err(self.pos, "expected '>' after '/'");
                 }
                 self.advance(1);
-                return Ok(Node { name, attrs, children: Vec::new() });
+                return Ok(Node {
+                    name,
+                    attrs,
+                    children: Vec::new(),
+                });
             }
             if self.peek() == b'>' {
                 self.advance(1);
@@ -334,7 +417,11 @@ impl<'a> Parser<'a> {
                     return err(self.pos, "expected '>' on close tag");
                 }
                 self.advance(1);
-                return Ok(Node { name, attrs, children });
+                return Ok(Node {
+                    name,
+                    attrs,
+                    children,
+                });
             }
             children.push(self.parse_element()?);
         }
@@ -436,7 +523,10 @@ mod tests {
         assert!(matches!(p.events[1].fds, FdSpec::None));
         match &p.events[2].fds {
             FdSpec::Product(parts) => {
-                assert_eq!(parts, &vec!["count".to_string(), "planes_per_buffer".to_string()]);
+                assert_eq!(
+                    parts,
+                    &vec!["count".to_string(), "planes_per_buffer".to_string()]
+                );
             }
             _ => panic!("expected Product"),
         }

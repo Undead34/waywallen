@@ -8,3 +8,6 @@ build
 .cache
 /bin
 /install/
+*.AppImage
+CMakeUserPresets.json
+/waywallen-test*.md

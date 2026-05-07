@@ -1,18 +1,10 @@
 //! Session-bus presence + control surface for the daemon.
-//!
-//! Consumers (e.g. the KDE wallpaper plugin wrapping
-//! `waywallen-display`) watch `org.freedesktop.DBus.NameOwnerChanged` for
-//! our well-known name to drive immediate reconnects without waiting for
-//! their local backoff timer.
-//!
-//! The bus is **optional** — if `Connection::session()` fails we log a
-//! warning and continue. Nothing in the daemon's data path depends on it.
-//!
-//! Methods here are thin wrappers around `crate::control`; the tray menu
-//! hits those functions directly without bouncing through D-Bus.
 
+use std::path::Path;
 use std::sync::Arc;
 
+use zbus::fdo::RequestNameFlags;
+use zbus::names::WellKnownName;
 use zbus::{interface, Connection, SignalContext};
 
 use crate::control;
@@ -29,6 +21,14 @@ pub struct Daemon1 {
 
 #[interface(name = "org.waywallen.waywallen.Daemon1")]
 impl Daemon1 {
+    /// Crate version (Cargo.toml). UI compares this against its own
+    /// build-time `APP_VERSION` to gate the connection — mismatched
+    /// builds stay disconnected and surface a dialog.
+    #[zbus(property)]
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
     #[zbus(property)]
     fn display_socket_path(&self) -> &str {
         &self.display_socket_path
@@ -36,20 +36,46 @@ impl Daemon1 {
 
     #[zbus(property)]
     fn ws_port(&self) -> u16 {
-        self.app
-            .ws_port
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.app.ws_port.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     #[zbus(property)]
     async fn current_wallpaper_id(&self) -> String {
         self.app
-            .playlist
+            .queue
             .lock()
             .await
             .current
             .clone()
             .unwrap_or_default()
+    }
+
+    /// Live queue playback mode: `"sequential"`, `"shuffle"`, or
+    /// `"random"`. Setter persists to settings and emits
+    /// `PropertiesChanged`.
+    #[zbus(property)]
+    async fn queue_mode(&self) -> String {
+        self.app.queue.lock().await.mode.as_str().to_owned()
+    }
+
+    #[zbus(property)]
+    async fn set_queue_mode(&self, value: String) -> zbus::Result<()> {
+        let mode = crate::queue::Mode::from_str(&value).ok_or_else(|| {
+            zbus::Error::InvalidField
+        })?;
+        control::set_mode(&self.app, mode).await;
+        Ok(())
+    }
+
+    /// Auto-rotation interval in seconds; `0` disables.
+    #[zbus(property)]
+    fn rotation_secs(&self) -> u32 {
+        self.app.rotation.interval()
+    }
+
+    #[zbus(property)]
+    async fn set_rotation_secs(&self, secs: u32) {
+        control::set_rotation_interval(&self.app, secs).await;
     }
 
     async fn open_ui(&self) -> zbus::fdo::Result<()> {
@@ -64,39 +90,39 @@ impl Daemon1 {
     async fn next(&self) -> zbus::fdo::Result<String> {
         control::step(&self.app, 1)
             .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(zbus::fdo::Error::from)
     }
 
     async fn previous(&self) -> zbus::fdo::Result<String> {
         control::step(&self.app, -1)
             .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(zbus::fdo::Error::from)
     }
 
     async fn pause(&self) -> zbus::fdo::Result<()> {
         control::pause_all(&self.app)
             .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(zbus::fdo::Error::from)
     }
 
     async fn resume(&self) -> zbus::fdo::Result<()> {
         control::resume_all(&self.app)
             .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(zbus::fdo::Error::from)
     }
 
     async fn rescan(&self) -> zbus::fdo::Result<u32> {
         control::rescan(&self.app)
             .await
             .map(|n| n as u32)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(zbus::fdo::Error::from)
     }
 
     async fn apply_by_id(&self, id: String) -> zbus::fdo::Result<String> {
-        control::apply_wallpaper_by_id(&self.app, &id, 0, 0, 0)
+        control::apply_wallpaper_by_id(&self.app, &id, 0, 0)
             .await
             .map(|r| r.renderer_id)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(zbus::fdo::Error::from)
     }
 
     /// Toggle shuffle on the active playlist. Persisted to settings so
@@ -110,47 +136,11 @@ impl Daemon1 {
         control::set_rotation_interval(&self.app, secs).await;
     }
 
-    /// Activate a persisted playlist by id. Loads its mode/filter and
-    /// resolves member ids against the current snapshot.
-    async fn activate_playlist(&self, id: i64) -> zbus::fdo::Result<()> {
-        control::activate_playlist(&self.app, id)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
-    }
-
-    /// Switch back to the All pseudo-playlist.
-    async fn deactivate_playlist(&self) -> zbus::fdo::Result<()> {
-        control::deactivate_playlist(&self.app)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
-    }
-
-    /// Snapshot of every persisted playlist. Tuple shape
-    /// `(id, name, source_kind, mode, interval_secs, item_count)`.
-    async fn list_playlists(&self) -> zbus::fdo::Result<Vec<(i64, String, String, String, u32, u32)>> {
-        let rows = control::list_playlists(&self.app)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|s| {
-                (
-                    s.id,
-                    s.name,
-                    s.source_kind,
-                    s.mode,
-                    s.interval_secs.max(0) as u32,
-                    s.item_count,
-                )
-            })
-            .collect())
-    }
-
-    /// Live status of the active playlist. Tuple shape
+    /// Live status of the active queue. Tuple shape
     /// `(active_id, mode, interval_secs, current_id, position, count, is_smart)`.
     /// `active_id = 0` and `current_id = ""` represent absence.
-    async fn playlist_status(&self) -> (i64, String, u32, String, u32, u32, bool) {
-        let s = control::playlist_status(&self.app).await;
+    async fn queue_status(&self) -> (i64, String, u32, String, u32, u32, bool) {
+        let s = control::queue_status(&self.app).await;
         (
             s.active_id.unwrap_or(0),
             s.mode,
@@ -210,13 +200,57 @@ impl Daemon1 {
     async fn shutting_down(emitter: &SignalContext<'_>) -> zbus::Result<()>;
 }
 
-/// Connect to the session bus, publish the interface, and claim
-/// `org.waywallen.waywallen.Daemon`. Returns the `Connection` so the caller can keep
-/// it alive for the process lifetime and emit signals through it.
+/// Single-instance gate. Connects to the session bus and tries to claim
+/// `BUS_NAME` with `DO_NOT_QUEUE`. Three outcomes:
 ///
-/// On any failure (no session bus, name already owned, …) returns `Err`;
-/// the caller should log and continue headless.
-pub async fn connect(
+/// * primary owner ⇒ returns the live `Connection` (caller serves the
+///   interface on it later via [`serve`]).
+/// * name already taken ⇒ `execv`s into `ui_path`. The current PID
+///   becomes the UI process so desktop integration (startup notification
+///   cookie, systemd transient unit, taskbar grouping) stays attached to
+///   the user's launch. `ui_path = None` ⇒ exits 0.
+/// * session bus unavailable / `RequestName` errored ⇒ exits 1. Without
+///   a session bus we can't enforce single-instance.
+pub async fn acquire_or_handoff(ui_path: Option<&Path>) -> Connection {
+    let conn = match Connection::session().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("waywallen: dbus session bus unavailable: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let name: WellKnownName<'_> = WellKnownName::try_from(BUS_NAME).expect("valid bus name");
+    // zbus 4 maps the `Exists` / `InQueue` reply codes to
+    // `Error::NameTaken` / `Error::NameInQueue`; only `PrimaryOwner`
+    // and `AlreadyOwner` come back as `Ok`.
+    match conn
+        .request_name_with_flags(name, RequestNameFlags::DoNotQueue.into())
+        .await
+    {
+        Ok(_) => conn,
+        Err(zbus::Error::NameTaken) => {
+            let Some(ui) = ui_path else {
+                eprintln!("waywallen: already running, no UI to launch");
+                std::process::exit(0);
+            };
+            log::info!("waywallen already running; exec into {}", ui.display());
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(ui).exec();
+            eprintln!("waywallen: exec {} failed: {err}", ui.display());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("waywallen: dbus RequestName failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Publish the `Daemon1` interface on a connection that already owns
+/// `BUS_NAME` (returned by [`acquire_or_handoff`]).
+pub async fn serve(
+    conn: Connection,
     app: Arc<AppState>,
     display_socket_path: String,
 ) -> zbus::Result<Arc<Connection>> {
@@ -224,11 +258,7 @@ pub async fn connect(
         app,
         display_socket_path,
     };
-    let conn = zbus::connection::Builder::session()?
-        .name(BUS_NAME)?
-        .serve_at(OBJECT_PATH, iface)?
-        .build()
-        .await?;
+    conn.object_server().at(OBJECT_PATH, iface).await?;
     Ok(Arc::new(conn))
 }
 
@@ -250,4 +280,63 @@ pub async fn emit_shutting_down(conn: &Connection) -> zbus::Result<()> {
         .interface::<_, Daemon1>(OBJECT_PATH)
         .await?;
     Daemon1::shutting_down(iface_ref.signal_context()).await
+}
+
+/// Snapshot of the dbus connection from `AppState`. Callers can take
+/// it across an await without holding the std::sync::Mutex.
+fn live_conn(app: &AppState) -> Option<Arc<Connection>> {
+    app.dbus_conn.lock().unwrap().clone()
+}
+
+pub async fn notify_queue_mode_changed(app: &AppState) {
+    let conn = match live_conn(app) {
+        Some(c) => c,
+        None => return,
+    };
+    let iface = match conn
+        .object_server()
+        .interface::<_, Daemon1>(OBJECT_PATH)
+        .await
+    {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    let inner = iface.get().await;
+    let _ = inner.queue_mode_changed(iface.signal_context()).await;
+}
+
+pub async fn notify_rotation_secs_changed(app: &AppState) {
+    let conn = match live_conn(app) {
+        Some(c) => c,
+        None => return,
+    };
+    let iface = match conn
+        .object_server()
+        .interface::<_, Daemon1>(OBJECT_PATH)
+        .await
+    {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    let inner = iface.get().await;
+    let _ = inner.rotation_secs_changed(iface.signal_context()).await;
+}
+
+pub async fn notify_current_wallpaper_id_changed(app: &AppState) {
+    let conn = match live_conn(app) {
+        Some(c) => c,
+        None => return,
+    };
+    let iface = match conn
+        .object_server()
+        .interface::<_, Daemon1>(OBJECT_PATH)
+        .await
+    {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    let inner = iface.get().await;
+    let _ = inner
+        .current_wallpaper_id_changed(iface.signal_context())
+        .await;
 }

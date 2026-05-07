@@ -2,6 +2,7 @@ pragma ValueTypeBehavior: Assertable
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Shapes
+import QtQuick.Templates as T
 import Qcm.Material as MD
 import waywallen.ui as W
 
@@ -14,6 +15,34 @@ MD.Page {
     readonly property real displayGapPx: 80
 
     property var selectedId: null
+
+    // FillMode/Align enum values mirror proto::FillMode / proto::Align
+    // (control.proto). Keep the *_VALUES arrays in lockstep with the
+    // enum order; *_LABELS is what the UI shows.
+    readonly property var kFillModeValues: [1 // STRETCHED
+        , 2 // PRESERVE_ASPECT_FIT
+        , 3 // PRESERVE_ASPECT_CROP
+        , 7 // CENTERED
+        , 4 // TILED
+        , 5 // TILED_ONLY_HORIZONTAL
+        , 6  // TILED_ONLY_VERTICAL
+    ]
+    readonly property var kFillModeLabels: ["Stretch", "Fit (preserve aspect)", "Crop (preserve aspect)", "Center (1:1)", "Tile", "Tile horizontally", "Tile vertically"]
+    function fillmodeIndex(value) {
+        const i = root.kFillModeValues.indexOf(value);
+        return i < 0 ? 0 : i;
+    }
+
+    // 3×3 align grid; index = row * 3 + col, values match proto::Align.
+    readonly property var kAlignValues: [1, 2, 3 // top-left, top, top-right
+        , 4, 5, 6 // left, center, right
+        , 7, 8, 9  // bottom-left, bottom, bottom-right
+    ]
+    readonly property var kAlignTooltips: ["Top-left", "Top", "Top-right", "Left", "Center", "Right", "Bottom-left", "Bottom", "Bottom-right"]
+
+    W.DisplayLayoutSetQuery {
+        id: layoutSetQuery
+    }
 
     function layoutRects() {
         const out = [];
@@ -278,45 +307,251 @@ MD.Page {
                 }
 
                 MD.Text {
-                    text: "Bindings"
+                    text: "Connected renderer"
                     typescale: MD.Token.typescale.title_small
                     color: MD.Token.color.on_surface
                 }
 
-                MD.Text {
+                RowLayout {
+                    id: connectedRendererRow
+                    readonly property string connectedId: {
+                        if (!root.selected)
+                            return "";
+                        const links = root.selected.links || [];
+                        return links.length > 0 ? (links[0].rendererId || "") : "";
+                    }
+                    // Re-resolve when the manager's renderer list changes
+                    // (the `renderers` access wires up the dependency) so a
+                    // late RendererUpsert or a RendererRemoved is reflected
+                    // without manual refresh.
+                    readonly property var renderer: {
+                        const _ = W.App.rendererManager.renderers;
+                        return connectedId.length > 0 ? W.App.rendererManager.get(connectedId) : null;
+                    }
                     Layout.fillWidth: true
-                    visible: !!root.selected && (!root.selected.links || root.selected.links.length === 0)
-                    text: "Idle — no renderer bound."
-                    typescale: MD.Token.typescale.body_small
-                    color: MD.Token.color.on_surface_variant
-                    wrapMode: Text.WordWrap
-                }
+                    spacing: 8
 
-                Repeater {
-                    model: root.selected ? root.selected.links : []
-                    delegate: RowLayout {
-                        required property var modelData
-                        Layout.fillWidth: true
-                        spacing: 8
-
-                        MD.Icon {
-                            name: MD.Token.icon.play_arrow
-                            size: 18
-                            color: MD.Token.color.primary
+                    MD.Icon {
+                        readonly property string status: connectedRendererRow.renderer ? connectedRendererRow.renderer.status : ""
+                        name: {
+                            if (!connectedRendererRow.renderer)
+                                return MD.Token.icon.pause;
+                            return status === "paused" ? MD.Token.icon.pause : MD.Token.icon.play_arrow;
                         }
+                        size: 24
+                        color: !connectedRendererRow.renderer || status === "paused" ? MD.Token.color.on_surface_variant : MD.Token.color.primary
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 0
+
                         MD.Text {
                             Layout.fillWidth: true
-                            text: modelData.rendererId
-                            typescale: MD.Token.typescale.body_small
-                            color: MD.Token.color.on_surface
-                            font.family: "monospace"
+                            text: {
+                                const r = connectedRendererRow.renderer;
+                                if (r) {
+                                    const name = (r.name && r.name.length) ? r.name : "renderer";
+                                    return r.pid > 0 ? (name + "-" + r.pid) : name;
+                                }
+                                if (connectedRendererRow.connectedId.length > 0) {
+                                    return connectedRendererRow.connectedId;
+                                }
+                                return "Idle — no renderer connected.";
+                            }
+                            typescale: MD.Token.typescale.body_medium
+                            color: connectedRendererRow.renderer ? MD.Token.color.on_surface : MD.Token.color.on_surface_variant
+                            font.family: connectedRendererRow.renderer ? "monospace" : ""
                             elide: Text.ElideMiddle
                         }
+
                         MD.Text {
-                            text: "z=" + modelData.zOrder
+                            Layout.fillWidth: true
+                            visible: !!connectedRendererRow.renderer
+                            text: {
+                                const r = connectedRendererRow.renderer;
+                                if (!r)
+                                    return "";
+                                return (r.status || "") + " · " + (r.fps || 0) + " fps";
+                            }
                             typescale: MD.Token.typescale.label_small
                             color: MD.Token.color.on_surface_variant
+                            elide: Text.ElideRight
                         }
+                    }
+                }
+
+                // ---- Layout (fillmode + align) ----
+                MD.Divider {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 8
+                    Layout.bottomMargin: 4
+                    visible: !!root.selected
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: !!root.selected
+                    spacing: 8
+
+                    MD.Text {
+                        Layout.fillWidth: true
+                        text: "Layout"
+                        typescale: MD.Token.typescale.title_small
+                        color: MD.Token.color.on_surface
+                    }
+
+                    Item {
+                        implicitWidth: children[0].implicitWidth
+                        MD.IconButton {
+                            anchors.verticalCenter: parent.verticalCenter
+                            mdState.size: MD.Enum.XS
+                            visible: {
+                                if (!root.selected)
+                                    return false;
+                                const ovr = root.selected.layoutOverride || ({});
+                                return ovr.fillmodeSet === true || ovr.alignSet === true || ovr.clearRgbaSet === true;
+                            }
+                            icon.name: MD.Token.icon.refresh
+                            T.ToolTip.visible: hovered
+                            T.ToolTip.text: "Revert to global default"
+                            onClicked: {
+                                if (!root.selected)
+                                    return;
+                                layoutSetQuery.name = root.selected.name;
+                                layoutSetQuery.fillmodeSet = false;
+                                layoutSetQuery.alignSet = false;
+                                layoutSetQuery.clearRgbaSet = false;
+                                layoutSetQuery.clearFillmode = true;
+                                layoutSetQuery.clearAlign = true;
+                                layoutSetQuery.clearClearRgba = true;
+                                layoutSetQuery.reload();
+                            }
+                        }
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: !!root.selected
+                    spacing: 12
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 4
+
+                        MD.Text {
+                            text: "Fill mode"
+                            typescale: MD.Token.typescale.label_medium
+                            color: MD.Token.color.on_surface_variant
+                        }
+
+                        MD.ComboBox {
+                            id: fillmodeBox
+                            Layout.fillWidth: true
+                            model: root.kFillModeLabels
+                            currentIndex: {
+                                if (!root.selected)
+                                    return 0;
+                                const eff = root.selected.effectiveLayout || ({});
+                                return root.fillmodeIndex(eff.fillmode || 0);
+                            }
+                            onActivated: idx => {
+                                if (!root.selected)
+                                    return;
+                                layoutSetQuery.name = root.selected.name;
+                                layoutSetQuery.fillmodeSet = true;
+                                layoutSetQuery.fillmode = root.kFillModeValues[idx];
+                                layoutSetQuery.alignSet = false;
+                                layoutSetQuery.clearRgbaSet = false;
+                                layoutSetQuery.clearFillmode = false;
+                                layoutSetQuery.clearAlign = false;
+                                layoutSetQuery.clearClearRgba = false;
+                                layoutSetQuery.reload();
+                            }
+                        }
+                    }
+
+                    ColumnLayout {
+                        spacing: 4
+
+                        MD.Text {
+                            text: "Align"
+                            typescale: MD.Token.typescale.label_medium
+                            color: MD.Token.color.on_surface_variant
+                        }
+
+                        // 3×3 grid of toggle pads. Disabled when the
+                        // active fillmode is Stretched (align has no effect).
+                        GridLayout {
+                            columns: 3
+                            rowSpacing: 4
+                            columnSpacing: 4
+                            enabled: {
+                                if (!root.selected)
+                                    return false;
+                                const eff = root.selected.effectiveLayout || ({});
+                                // Stretched (1) ignores align.
+                                return (eff.fillmode || 0) !== 1;
+                            }
+                            opacity: enabled ? 1.0 : 0.4
+
+                            Repeater {
+                                model: 9
+                                delegate: Rectangle {
+                                    required property int index
+
+                                    readonly property int alignValue: root.kAlignValues[index]
+                                    readonly property bool isCurrent: {
+                                        if (!root.selected)
+                                            return false;
+                                        const eff = root.selected.effectiveLayout || ({});
+                                        return (eff.align || 0) === alignValue;
+                                    }
+
+                                    width: 22
+                                    height: 22
+                                    radius: 4
+                                    color: isCurrent ? MD.Token.color.primary : MD.Token.color.surface_container_highest
+                                    border.color: MD.Token.color.outline
+                                    border.width: 1
+
+                                    Rectangle {
+                                        anchors.centerIn: parent
+                                        width: 6
+                                        height: 6
+                                        radius: 3
+                                        color: parent.isCurrent ? MD.Token.color.on_primary : MD.Token.color.on_surface_variant
+                                    }
+
+                                    T.ToolTip.visible: ma.containsMouse
+                                    T.ToolTip.text: root.kAlignTooltips[index]
+
+                                    MouseArea {
+                                        id: ma
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        onClicked: {
+                                            if (!root.selected)
+                                                return;
+                                            layoutSetQuery.name = root.selected.name;
+                                            layoutSetQuery.fillmodeSet = false;
+                                            layoutSetQuery.alignSet = true;
+                                            layoutSetQuery.align = parent.alignValue;
+                                            layoutSetQuery.clearRgbaSet = false;
+                                            layoutSetQuery.clearFillmode = false;
+                                            layoutSetQuery.clearAlign = false;
+                                            layoutSetQuery.clearClearRgba = false;
+                                            layoutSetQuery.reload();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Item {
+                        Layout.fillWidth: true
                     }
                 }
             }

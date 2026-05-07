@@ -19,7 +19,7 @@
 //!
 //! Without a Watcher we record a warning and bail — the daemon keeps running.
 
-mod dbusmenu;
+pub mod dbusmenu;
 mod sni;
 
 use std::sync::Arc;
@@ -30,13 +30,23 @@ use zbus::Connection;
 use crate::AppState;
 
 const ITEM_PATH: &str = "/StatusNotifierItem";
-const MENU_PATH: &str = "/MenuBar";
+pub const MENU_PATH: &str = "/MenuBar";
 const WATCHER_SERVICE: &str = "org.kde.StatusNotifierWatcher";
 const WATCHER_PATH: &str = "/StatusNotifierWatcher";
 const WATCHER_IFACE: &str = "org.kde.StatusNotifierWatcher";
 
 pub async fn spawn(conn: Arc<Connection>, app: Arc<AppState>) -> Result<()> {
-    let item = sni::StatusNotifierItem::new(app.clone());
+    // Hosts (Plasma/Waybar/...) resolve `IconName` against their own
+    // `XDG_DATA_DIRS`, which never include the AppImage squashfs mount or
+    // a relocatable Flatpak/portable prefix. Derive `<prefix>/share/icons`
+    // from `current_exe()` (`<prefix>/bin/waywallen`) and expose it via
+    // SNI's `IconThemePath` so the host appends it to its theme search.
+    let icon_theme_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent()?.parent().map(|p| p.join("share/icons")))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let item = sni::StatusNotifierItem::new(app.clone(), icon_theme_path);
     let menu = dbusmenu::DBusMenu::new(app.clone());
 
     conn.object_server().at(ITEM_PATH, item).await?;

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.28)
 
 set(APP_ID org.waywallen.waywallen)
 set(APP_NAME "waywallen-ui")
-set(APP_VERSION "0.1.0")
+set(APP_VERSION "0.1.2")
 set(APP_SUMMARY "Wallpaper manager for Wayland")
 set(APP_AUTHOR "hypengw")
 
@@ -32,17 +32,21 @@ if("${QT_INSTALL_QML}" STREQUAL "")
   set(QT_INSTALL_QML "${CMAKE_INSTALL_LIBDIR}/qt6/qml")
 endif()
 
-# FetchContent driver. To enable the flatpak-aware dependency provider
-# (source redirect + transitive auto-record), pass on the cmake command line:
-#   -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=cmake/FetchDepsProvider.cmake
-include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FetchDeps.cmake)
-fetchdeps(${CMAKE_CURRENT_SOURCE_DIR}/deps.json)
+# cubeb
+set(BUILD_TESTS OFF)
+set(BUILD_TOOLS OFF)
+set(BUNDLE_SPEEX ON)
+set(USE_SANITIZERS OFF)
+set(USE_WINMM OFF)
+include(${CMAKE_SOURCE_DIR}/cmake/FetchDeps.cmake)
+fetchdeps(${CMAKE_SOURCE_DIR}/deps.json)
 
 qt_standard_project_setup()
 
 # ---------------------------------------------------------------------------
 # Control-plane protobuf (shared schema with the Rust backend).
-# Generates C++/QML types from ../proto/control.proto via qt_add_protobuf.
+# Generates C++/QML types from ../proto/control.proto and ../proto/filter.proto
+# via qt_add_protobuf.
 # ---------------------------------------------------------------------------
 set(WAYWALLEN_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../proto")
 qt_add_protobuf(waywallen-control
@@ -50,6 +54,7 @@ qt_add_protobuf(waywallen-control
     QML_URI waywallen.control
     PROTO_FILES
         "${WAYWALLEN_PROTO_DIR}/control.proto"
+        "${WAYWALLEN_PROTO_DIR}/filter.proto"
     PROTO_INCLUDES
         "${WAYWALLEN_PROTO_DIR}"
 )
@@ -66,12 +71,15 @@ set(SOURCES_NO_MOC
   src/msg/store.cpp
   src/model/store_item.cpp
   src/model/list_models.cpp
+  src/model/filter_rule_model.cpp
   src/query/wallpaper_query.cpp
   src/query/renderer_query.cpp
   src/query/source_query.cpp
   src/query/health_query.cpp
   src/query/display_query.cpp
   src/query/library_query.cpp
+  src/query/settings_query.cpp
+  src/thumb/service.cpp
 )
 
 set(SOURCES
@@ -90,12 +98,15 @@ set(MOC_SOURCE_FILES
   src/msg/store.cppm
   src/model/store_item.cppm
   src/model/list_models.cppm
+  src/model/filter_rule_model.cppm
   src/query/wallpaper_query.cppm
   src/query/renderer_query.cppm
   src/query/source_query.cppm
   src/query/health_query.cppm
   src/query/display_query.cppm
   src/query/library_query.cppm
+  src/query/settings_query.cppm
+  src/thumb/service.cppm
 )
 set(MODULES
     src/mod.cppm
@@ -110,6 +121,17 @@ set(QML_FILES
   qml/Window.qml
   qml/component/StatusDot.qml
   qml/component/PagePopup.qml
+  qml/component/ThumbnailImage.qml
+  qml/component/filter/BaseFilter.qml
+  qml/component/filter/StringFilter.qml
+  qml/component/filter/IntFilter.qml
+  qml/component/filter/AspectFilter.qml
+  qml/component/filter/EmptyFilter.qml
+  qml/component/filter/WallpaperFilter.qml
+  qml/component/settings/SettingField.qml
+  qml/component/settings/PluginSettingsPopup.qml
+  qml/dialog/DaemonNotRunDialog.qml
+  qml/dialog/WallpaperFilterDialog.qml
   qml/page/WallpaperPage.qml
   qml/page/WallpaperCard.qml
   qml/page/StatusPage.qml
@@ -147,6 +169,8 @@ qt_add_qml_module(
   QtQuick.Dialogs
   Qcm.Material
   waywallen.control
+  OUTPUT_TARGETS
+  waywallen_ui_targets
   RESOURCE_PREFIX
   /
   VERSION
@@ -202,10 +226,14 @@ target_link_libraries(waywallen-qml
     qml_material::qml_material
     ncrequest
     qextra
+    wavsen::decode
 )
 
 qt_add_executable(${PROJECT_NAME} MANUAL_FINALIZATION src/main.cpp)
-set_target_properties(${PROJECT_NAME} PROPERTIES CXX_SCAN_FOR_MODULES ON)
+set_target_properties(${PROJECT_NAME} PROPERTIES 
+  CXX_SCAN_FOR_MODULES ON
+  INSTALL_RPATH "${WAYWALLEN_BIN_RPATH}"
+)
 target_compile_definitions(${PROJECT_NAME} PRIVATE "${APP_INFO_MACROS}")
 target_link_libraries(${PROJECT_NAME} PRIVATE waywallen-qml)
 

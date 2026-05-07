@@ -4,6 +4,7 @@ import QtQuick.Layouts
 import QtQuick.Templates as T
 import Qcm.Material as MD
 import waywallen.ui as W
+import "../component/settings"
 
 MD.Page {
     id: root
@@ -11,8 +12,6 @@ MD.Page {
     showHeader: true
     showBackground: false
     title: 'Status'
-
-    readonly property bool anyQuerying: healthQuery.querying || rendererQuery.querying || pluginQuery.querying || sourceQuery.querying
 
     component SectionTitle: MD.Text {
         typescale: MD.Token.typescale.title_medium
@@ -35,22 +34,57 @@ MD.Page {
 
     W.HealthQuery {
         id: healthQuery
-        Component.onCompleted: reload()
     }
 
     W.RendererListQuery {
         id: rendererQuery
-        Component.onCompleted: reload()
     }
 
     W.RendererPluginListQuery {
         id: pluginQuery
-        Component.onCompleted: reload()
+    }
+
+    W.SettingsGetQuery {
+        id: settingsQuery
+    }
+
+    // Queries fan out only after the daemon is Ready (avoid hitting
+    // a half-booted daemon at UI startup). `daemonReady` is edge-
+    // triggered, so pages constructed AFTER ready also need the level
+    // check in `Component.onCompleted`.
+    Connections {
+        target: W.Notify
+        function onDaemonReady() {
+            root.reloadAll();
+        }
+        function onSettingsChanged() {
+            settingsQuery.reload();
+        }
+    }
+
+    Component.onCompleted: {
+        if (W.Notify.daemonPhase === W.Notify.DaemonPhase.Ready)
+            reloadAll();
+    }
+
+    Connections {
+        target: settingsQuery
+        function onPluginsChanged() {
+            if (pluginSettingsPopup.opened) {
+                const p = settingsQuery.plugins[pluginSettingsPopup.pluginName];
+                pluginSettingsPopup.syncCurrent(p);
+            }
+        }
+    }
+
+    PluginSettingsPopup {
+        id: pluginSettingsPopup
+        pluginName: ""
+        schemaList: []
     }
 
     W.SourceListQuery {
         id: sourceQuery
-        Component.onCompleted: reload()
     }
 
     function reloadAll() {
@@ -58,6 +92,7 @@ MD.Page {
         rendererQuery.reload();
         pluginQuery.reload();
         sourceQuery.reload();
+        settingsQuery.reload();
     }
 
     function rendererLabel(d) {
@@ -147,7 +182,7 @@ MD.Page {
                         }
 
                         MD.Text {
-                            text: healthQuery.state || (healthQuery.querying ? "Loading…" : "unknown")
+                            text: healthQuery.state || "unknown"
                             typescale: MD.Token.typescale.body_medium
                             color: MD.Token.color.on_surface
                         }
@@ -165,8 +200,9 @@ MD.Page {
                     }
 
                     SectionHint {
-                        visible: !rendererQuery.instances || rendererQuery.instances.length === 0
-                        text: rendererQuery.querying ? "Loading…" : "No active renderers"
+                        readonly property var liveRenderers: W.App.rendererManager.renderers
+                        visible: !liveRenderers || liveRenderers.length === 0
+                        text: "No active renderers"
                     }
 
                     ListView {
@@ -176,7 +212,11 @@ MD.Page {
                         interactive: false
                         spacing: 4
 
-                        model: rendererQuery.instances
+                        // Live, push-updated. Backend events (RendererSnapshot /
+                        // RendererChanged / RendererRemoved) flow through
+                        // RendererManager so a child process exiting drops out of
+                        // this list without needing a manual refresh.
+                        model: W.App.rendererManager.renderers
 
                         delegate: MD.ListItem {
                             required property var modelData
@@ -221,7 +261,7 @@ MD.Page {
 
                     SectionHint {
                         visible: !pluginQuery.renderers || pluginQuery.renderers.length === 0
-                        text: pluginQuery.querying ? "Loading…" : "No renderer plugins"
+                        text: "No renderer plugins"
                     }
 
                     ListView {
@@ -234,7 +274,10 @@ MD.Page {
                         model: pluginQuery.renderers
 
                         delegate: MD.ListItem {
+                            id: pluginItem
                             required property var modelData
+
+                            readonly property bool hasSettings: (modelData.settings && modelData.settings.length > 0) === true
 
                             width: ListView.view.width
                             radius: 12
@@ -245,10 +288,27 @@ MD.Page {
                                 size: 24
                                 color: MD.Token.color.on_surface_variant
                             }
-                            trailing: MD.Text {
-                                text: (modelData.version || "v0.0.0")
-                                typescale: MD.Token.typescale.label_small
-                                color: MD.Token.color.on_surface_variant
+                            trailing: RowLayout {
+                                spacing: 4
+                                MD.Text {
+                                    text: (pluginItem.modelData.version || "v0.0.0")
+                                    typescale: MD.Token.typescale.label_small
+                                    color: MD.Token.color.on_surface_variant
+                                }
+                                MD.IconButton {
+                                    visible: pluginItem.hasSettings
+                                    icon.name: MD.Token.icon.settings
+                                    onClicked: {
+                                        pluginSettingsPopup.pluginName = pluginItem.modelData.name;
+                                        pluginSettingsPopup.schemaList = pluginItem.modelData.settings || [];
+                                        pluginSettingsPopup.allCurrentPlugins = settingsQuery.plugins || ({});
+                                        pluginSettingsPopup.currentGlobal = settingsQuery.global || ({});
+                                        const p = settingsQuery.plugins ? settingsQuery.plugins[pluginItem.modelData.name] : undefined;
+                                        pluginSettingsPopup.currentValues = p || ({});
+                                        pluginSettingsPopup.pendingValues = ({});
+                                        pluginSettingsPopup.open();
+                                    }
+                                }
                             }
                         }
                     }
@@ -268,7 +328,7 @@ MD.Page {
                             Layout.fillWidth: true
                         }
                         MD.IconButton {
-                            icon.name: MD.Token.icon.settings
+                            icon.name: MD.Token.icon.hard_drive
                             onClicked: MD.Util.showPopup('waywallen.ui/PagePopup', {
                                 source: 'waywallen.ui/SourceManagePage'
                             }, root)
@@ -277,7 +337,7 @@ MD.Page {
 
                     SectionHint {
                         visible: !sourceQuery.sources || sourceQuery.sources.length === 0
-                        text: sourceQuery.querying ? "Loading…" : "No source plugins loaded"
+                        text: "No source plugins loaded"
                     }
 
                     ListView {

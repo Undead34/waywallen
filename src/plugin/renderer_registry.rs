@@ -19,12 +19,135 @@ pub struct RendererDef {
     pub name: String,
     pub bin: PathBuf,
     pub types: Vec<WallpaperType>,
-    #[serde(default)]
-    pub extra_args: Vec<String>,
     #[serde(default = "default_priority")]
     pub priority: u32,
     #[serde(default = "default_version")]
     pub version: String,
+    /// Wire-protocol `Init.spawn_version` the daemon should emit when
+    /// spawning this renderer. `None` means "use the daemon's compile-
+    /// time `SPAWN_VERSION`" (legacy manifests). Step 2 keeps this
+    /// optional so old manifests behave identically; Step 3 will make
+    /// it the source of truth.
+    #[serde(default)]
+    pub spawn_version: Option<u32>,
+    /// Allow-listed extra metadata keys (beyond the canonical `path`).
+    /// Forwarded verbatim as `Init.resource_extras`. The daemon warns
+    /// when source-plugin metadata carries a key that's neither `path`
+    /// nor in this list nor in `settings`; Step 3 will turn the warning
+    /// into an error.
+    ///
+    /// Empty (the default) means "no extras". A manifest is considered
+    /// "schema-bearing" iff it has a non-empty `extras` OR a non-empty
+    /// `settings` table — the legacy "no schema" fall-through stays in
+    /// place for old manifests until OWE migrates wescene.
+    #[serde(default)]
+    pub extras: Vec<String>,
+    /// Optional schema for plugin-level settings (e.g. mpv's
+    /// `loop_file`, wescene's `volume`). Each entry declares a type
+    /// and a default; missing entries are filled from the default at
+    /// validation time. Empty (the default) means "no schema, no
+    /// validation".
+    #[serde(default)]
+    pub settings: HashMap<String, SettingDef>,
+    /// Opt-in inbound-event subscriptions. Recognized values: "pointer"
+    /// (covers pointer_motion / pointer_button / pointer_axis as a
+    /// family). Empty = renderer receives only the always-on inbound
+    /// events (init / setting_changed / play / pause / set_fps /
+    /// shutdown / negotiate_buffers); the daemon drops everything
+    /// else before encoding.
+    #[serde(default)]
+    pub events: Vec<String>,
+}
+
+/// Inbound-event family this renderer subscribed to via the manifest's
+/// `events` array. Recognized values are listed here so the daemon can
+/// reject unknown ones at parse time and keep the wire-side gating
+/// small and exhaustive.
+pub const EVENT_KIND_POINTER: &str = "pointer";
+
+/// Returns `true` when `name` matches one of the recognised
+/// inbound-event family strings.
+pub fn is_known_event_kind(name: &str) -> bool {
+    matches!(name, EVENT_KIND_POINTER)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SettingDef {
+    #[serde(rename = "type")]
+    pub ty: SettingType,
+    pub default: toml::Value,
+    /// When `true` (the default), the setting participates in the
+    /// renderer's identity hash — changing it should respawn the
+    /// renderer. When `false`, the setting is hot-applicable and
+    /// changes should be dispatched as `ApplySettings` instead
+    /// (Step 4 work).
+    #[serde(default = "default_true")]
+    pub identity: bool,
+    /// i18n key the UI binds to for the field label
+    /// (e.g. `"settings.video.loop_file"`). Optional — old manifests
+    /// without this stay valid; the UI falls back to the raw key name.
+    #[serde(default)]
+    pub label_key: Option<String>,
+    /// Optional i18n key for a short helper / tooltip line.
+    #[serde(default)]
+    pub description_key: Option<String>,
+    /// Numeric lower bound (inclusive) for `U32`/`F32` settings.
+    /// Ignored on string/bool. Out-of-range values from `SettingsSet`
+    /// are rejected; out-of-range values found at startup fall back
+    /// to `default` with a warning.
+    #[serde(default)]
+    pub min: Option<toml::Value>,
+    /// Numeric upper bound (inclusive). Same semantics as `min`.
+    #[serde(default)]
+    pub max: Option<toml::Value>,
+    /// Optional UI hint for slider/spinner step. Daemon does not
+    /// enforce step alignment (would block legitimate fine-grained
+    /// values); UIs can choose to snap.
+    #[serde(default)]
+    pub step: Option<toml::Value>,
+    /// Allowed string values. Only valid for `String` settings;
+    /// values outside the list are rejected by `SettingsSet` and
+    /// reset to default at startup.
+    #[serde(default)]
+    pub choices: Option<Vec<String>>,
+    /// Logical group key. UI groups settings sharing this name into
+    /// the same panel section. `None` = ungrouped.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Sort order within a group. Lower goes first. `0` for unspecified.
+    #[serde(default)]
+    pub order: Option<i32>,
+}
+
+impl SettingDef {
+    /// Bare-minimum constructor — fills the optional schema metadata
+    /// (`label_key`, `min`, `choices`, …) with `None`. Real manifests
+    /// flow through `serde::Deserialize` and never touch this; tests
+    /// and ad-hoc programmatic builds use it as a base.
+    pub fn new(ty: SettingType, default: toml::Value, identity: bool) -> Self {
+        Self {
+            ty,
+            default,
+            identity,
+            label_key: None,
+            description_key: None,
+            min: None,
+            max: None,
+            step: None,
+            choices: None,
+            group: None,
+            order: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SettingType {
+    U32,
+    F32,
+    String,
+    Bool,
 }
 
 fn default_priority() -> u32 {
@@ -33,6 +156,219 @@ fn default_priority() -> u32 {
 
 fn default_version() -> String {
     "v0.0.0".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Setting validation
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValidationError {
+    /// Setting value couldn't be coerced into the schema's declared
+    /// type.
+    BadSettingType {
+        key: String,
+        expected: SettingType,
+        got: String,
+    },
+    /// Numeric setting value fell outside the manifest's `[min, max]`
+    /// envelope.
+    OutOfRange {
+        key: String,
+        got: String,
+        min: Option<String>,
+        max: Option<String>,
+    },
+    /// String setting value didn't match any entry in the manifest's
+    /// `choices` allowlist.
+    BadChoice {
+        key: String,
+        got: String,
+        choices: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ValidationError::BadSettingType { key, expected, got } => write!(
+                f,
+                "plugin setting '{key}' expected type {expected:?}, got {got:?}"
+            ),
+            ValidationError::OutOfRange { key, got, min, max } => write!(
+                f,
+                "plugin setting '{key}' value {got:?} out of range (min={min:?}, max={max:?})"
+            ),
+            ValidationError::BadChoice { key, got, choices } => write!(
+                f,
+                "plugin setting '{key}' value {got:?} not in allowed choices {choices:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+/// Validate one already-typecast setting value against the manifest's
+/// optional `min` / `max` / `choices` envelope. Returns `Ok(())` when
+/// the value is in range or no constraints apply. Used by
+/// `Settings::reconcile` (startup) and by the `SettingsSet` RPC
+/// handler (incoming user edits).
+pub fn check_setting_bounds(
+    key: &str,
+    coerced: &str,
+    schema: &SettingDef,
+) -> std::result::Result<(), ValidationError> {
+    match schema.ty {
+        SettingType::U32 => {
+            let v: u32 = coerced
+                .parse()
+                .map_err(|_| ValidationError::BadSettingType {
+                    key: key.to_string(),
+                    expected: SettingType::U32,
+                    got: coerced.to_string(),
+                })?;
+            if let Some(min_v) = schema.min.as_ref().and_then(toml_to_u32) {
+                if v < min_v {
+                    return Err(out_of_range(key, coerced, schema));
+                }
+            }
+            if let Some(max_v) = schema.max.as_ref().and_then(toml_to_u32) {
+                if v > max_v {
+                    return Err(out_of_range(key, coerced, schema));
+                }
+            }
+            Ok(())
+        }
+        SettingType::F32 => {
+            let v: f32 = coerced
+                .parse()
+                .map_err(|_| ValidationError::BadSettingType {
+                    key: key.to_string(),
+                    expected: SettingType::F32,
+                    got: coerced.to_string(),
+                })?;
+            if let Some(min_v) = schema.min.as_ref().and_then(toml_to_f32) {
+                if v < min_v {
+                    return Err(out_of_range(key, coerced, schema));
+                }
+            }
+            if let Some(max_v) = schema.max.as_ref().and_then(toml_to_f32) {
+                if v > max_v {
+                    return Err(out_of_range(key, coerced, schema));
+                }
+            }
+            Ok(())
+        }
+        SettingType::String => {
+            if let Some(choices) = schema.choices.as_ref() {
+                if !choices.iter().any(|c| c == coerced) {
+                    return Err(ValidationError::BadChoice {
+                        key: key.to_string(),
+                        got: coerced.to_string(),
+                        choices: choices.clone(),
+                    });
+                }
+            }
+            Ok(())
+        }
+        SettingType::Bool => Ok(()),
+    }
+}
+
+/// Top-level entry for `SettingsSet`: typecheck a raw user value
+/// against the manifest schema and run bounds validation. Returns the
+/// canonicalised string on success.
+pub fn coerce_and_validate(
+    key: &str,
+    raw: &str,
+    schema: &SettingDef,
+) -> std::result::Result<String, ValidationError> {
+    let coerced =
+        coerce_setting(raw, schema.ty).ok_or_else(|| ValidationError::BadSettingType {
+            key: key.to_string(),
+            expected: schema.ty,
+            got: raw.to_string(),
+        })?;
+    check_setting_bounds(key, &coerced, schema)?;
+    Ok(coerced)
+}
+
+fn out_of_range(key: &str, coerced: &str, schema: &SettingDef) -> ValidationError {
+    ValidationError::OutOfRange {
+        key: key.to_string(),
+        got: coerced.to_string(),
+        min: schema.min.as_ref().map(toml_value_to_display),
+        max: schema.max.as_ref().map(toml_value_to_display),
+    }
+}
+
+fn toml_value_to_display(v: &toml::Value) -> String {
+    match v {
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn toml_to_u32(v: &toml::Value) -> Option<u32> {
+    match v {
+        toml::Value::Integer(i) if *i >= 0 => u32::try_from(*i).ok(),
+        toml::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn toml_to_f32(v: &toml::Value) -> Option<f32> {
+    match v {
+        toml::Value::Integer(i) => Some(*i as f32),
+        toml::Value::Float(f) => Some(*f as f32),
+        toml::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Try to interpret a raw `String` as a value of `ty`. Returns the
+/// canonicalised string form on success (e.g. `"42"` for u32, `"true"`
+/// for bool). Returns `None` if the value can't be coerced.
+fn coerce_setting(raw: &str, ty: SettingType) -> Option<String> {
+    match ty {
+        SettingType::U32 => raw.parse::<u32>().ok().map(|v| v.to_string()),
+        SettingType::F32 => raw.parse::<f32>().ok().map(|v| v.to_string()),
+        SettingType::Bool => match raw {
+            "true" | "false" => Some(raw.to_string()),
+            _ => None,
+        },
+        SettingType::String => Some(raw.to_string()),
+    }
+}
+
+/// Stringify a `toml::Value` default, coerced to `ty`. Returns `None`
+/// when the default is structurally incompatible (e.g. an array as a
+/// `u32` default).
+fn toml_default_to_string(value: &toml::Value, ty: SettingType) -> Option<String> {
+    match (value, ty) {
+        (toml::Value::Integer(i), SettingType::U32) => {
+            if *i >= 0 {
+                Some(i.to_string())
+            } else {
+                None
+            }
+        }
+        (toml::Value::Integer(i), SettingType::F32) => Some((*i as f32).to_string()),
+        (toml::Value::Float(f), SettingType::F32) => Some(f.to_string()),
+        (toml::Value::Boolean(b), SettingType::Bool) => Some(b.to_string()),
+        (toml::Value::String(s), SettingType::String) => Some(s.clone()),
+        // Common manifest mistake: declaring `default = "30"` for a
+        // u32 setting. Be lenient — try to parse the string.
+        (toml::Value::String(s), other) => coerce_setting(s, other),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -77,10 +413,26 @@ impl RendererRegistry {
                                 manifest.renderer.bin = manifest_dir.join(&manifest.renderer.bin);
                             }
                         }
+                        // Drop unrecognised event kinds with a warn — the
+                        // gating tables below only know about a small
+                        // closed set, so an unknown name in `events` is
+                        // effectively dead config.
+                        let renderer_name = manifest.renderer.name.clone();
+                        manifest.renderer.events.retain(|e| {
+                            if is_known_event_kind(e) {
+                                true
+                            } else {
+                                log::warn!(
+                                    "renderer {renderer_name}: dropping unknown event kind {e:?}"
+                                );
+                                false
+                            }
+                        });
                         log::info!(
-                            "loaded renderer manifest: {} (types: {:?})",
+                            "loaded renderer manifest: {} (types: {:?}, events: {:?})",
                             manifest.renderer.name,
-                            manifest.renderer.types
+                            manifest.renderer.types,
+                            manifest.renderer.events,
                         );
                         reg.register(manifest.renderer);
                     }
@@ -104,6 +456,17 @@ impl RendererRegistry {
     /// Find the highest-priority renderer for a wallpaper type.
     pub fn resolve(&self, wp_type: &str) -> Option<&RendererDef> {
         self.by_type.get(wp_type)?.first()
+    }
+
+    /// Find a renderer by its manifest `name`, regardless of type.
+    /// Returns the first occurrence — `register` keeps duplicates
+    /// across `by_type` so we walk every bucket and stop at the first
+    /// match.
+    pub fn resolve_by_name(&self, name: &str) -> Option<&RendererDef> {
+        self.by_type
+            .values()
+            .flat_map(|v| v.iter())
+            .find(|d| d.name == name)
     }
 
     /// List all wallpaper types that have at least one renderer.
@@ -176,4 +539,146 @@ pub fn standard_plugin_dirs(subdir: &str) -> Vec<PathBuf> {
     dirs.push(xdg.join("waywallen").join(subdir));
 
     dirs
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    fn test_setting(ty: SettingType, default: toml::Value, identity: bool) -> SettingDef {
+        SettingDef {
+            ty,
+            default,
+            identity,
+            label_key: None,
+            description_key: None,
+            min: None,
+            max: None,
+            step: None,
+            choices: None,
+            group: None,
+            order: None,
+        }
+    }
+
+    #[test]
+    fn manifest_parses_events_array() {
+        let src = r#"
+            [renderer]
+            name = "wescene-renderer"
+            bin = "/usr/bin/waywallen-wescene-renderer"
+            types = ["scene"]
+            events = ["pointer"]
+        "#;
+        let m: RendererManifest = toml::from_str(src).expect("parses");
+        assert_eq!(m.renderer.events, vec!["pointer".to_string()]);
+    }
+
+    #[test]
+    fn manifest_events_default_empty() {
+        let src = r#"
+            [renderer]
+            name = "waywallen-image"
+            bin = "/usr/bin/waywallen-image-renderer"
+            types = ["image"]
+        "#;
+        let m: RendererManifest = toml::from_str(src).expect("parses");
+        assert!(m.renderer.events.is_empty());
+    }
+
+    #[test]
+    fn manifest_parses_with_extras_and_settings() {
+        // End-to-end: TOML manifest → RendererDef. Wire-level details
+        // (extras whitelist, per-key SettingDef shape) are exercised
+        // through deserialization here so a regression in the manifest
+        // grammar is caught.
+        let src = r#"
+            [renderer]
+            name = "waywallen-mpv"
+            bin = "/usr/bin/waywallen-mpv-renderer"
+            types = ["video"]
+            priority = 100
+            spawn_version = 1
+            extras = ["subtitle"]
+
+            [renderer.settings]
+            loop_file = { type = "string", default = "inf",  identity = false }
+            hwdec     = { type = "string", default = "auto", identity = false }
+        "#;
+        let manifest: RendererManifest = toml::from_str(src).expect("manifest parses");
+        assert_eq!(manifest.renderer.spawn_version, Some(1));
+        assert_eq!(manifest.renderer.extras, vec!["subtitle".to_string()]);
+        assert_eq!(manifest.renderer.settings.len(), 2);
+    }
+
+    #[test]
+    fn coerce_and_validate_u32_in_range() {
+        let s = SettingDef {
+            min: Some(toml::Value::Integer(0)),
+            max: Some(toml::Value::Integer(100)),
+            ..test_setting(SettingType::U32, toml::Value::Integer(50), false)
+        };
+        assert_eq!(coerce_and_validate("volume", "75", &s).unwrap(), "75");
+        // boundaries inclusive
+        assert_eq!(coerce_and_validate("volume", "0", &s).unwrap(), "0");
+        assert_eq!(coerce_and_validate("volume", "100", &s).unwrap(), "100");
+    }
+
+    #[test]
+    fn coerce_and_validate_u32_out_of_range_errors() {
+        let s = SettingDef {
+            min: Some(toml::Value::Integer(0)),
+            max: Some(toml::Value::Integer(100)),
+            ..test_setting(SettingType::U32, toml::Value::Integer(50), false)
+        };
+        let err = coerce_and_validate("volume", "500", &s).expect_err("must error");
+        assert!(matches!(err, ValidationError::OutOfRange { ref key, .. } if key == "volume"));
+    }
+
+    #[test]
+    fn coerce_and_validate_f32_bounds() {
+        let s = SettingDef {
+            min: Some(toml::Value::Float(0.0)),
+            max: Some(toml::Value::Float(1.5)),
+            ..test_setting(SettingType::F32, toml::Value::Float(1.0), false)
+        };
+        assert!(coerce_and_validate("ratio", "0.75", &s).is_ok());
+        assert!(matches!(
+            coerce_and_validate("ratio", "2.0", &s),
+            Err(ValidationError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            coerce_and_validate("ratio", "-0.1", &s),
+            Err(ValidationError::OutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn coerce_and_validate_choices_hit_and_miss() {
+        let s = SettingDef {
+            choices: Some(vec!["auto".into(), "vaapi".into(), "nvdec".into()]),
+            ..test_setting(
+                SettingType::String,
+                toml::Value::String("auto".into()),
+                false,
+            )
+        };
+        assert_eq!(coerce_and_validate("hwdec", "vaapi", &s).unwrap(), "vaapi");
+        let err = coerce_and_validate("hwdec", "ssh", &s).expect_err("must error");
+        assert!(matches!(
+            err,
+            ValidationError::BadChoice { ref key, .. } if key == "hwdec"
+        ));
+    }
+
+    #[test]
+    fn coerce_and_validate_bad_type_errors() {
+        let s = test_setting(SettingType::U32, toml::Value::Integer(0), false);
+        let err = coerce_and_validate("fps", "lots", &s).expect_err("must error");
+        assert!(matches!(err, ValidationError::BadSettingType { .. }));
+    }
 }

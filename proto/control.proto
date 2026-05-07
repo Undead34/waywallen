@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package waywallen.control.v1;
 
+import "filter.proto";
+
 // ---------------------------------------------------------------------------
 // Envelope
 // ---------------------------------------------------------------------------
@@ -55,13 +57,21 @@ message Request {
     PlaylistActivateRequest   playlist_activate = 37;
     PlaylistDeactivateRequest playlist_deactivate = 38;
     PlaylistStatusRequest     playlist_status = 39;
+    DisplayLayoutSetRequest   display_layout_set = 40;
+    GpuListRequest            gpu_list = 41;
   }
 }
 
 message Response {
   uint64 request_id = 1;
+  // Coarse status class, kept for back-compat with clients that haven't
+  // adopted `error_code` yet. Derived from `error_code` server-side.
   Status status = 2;
   string message = 3;
+  // Typed error pin-pointing the failure. `ERROR_CODE_OK` (0) on success;
+  // every non-OK value carries one specific failure category. New clients
+  // should branch on this and treat `status`/`message` as legacy fields.
+  ErrorCode error_code = 4;
   oneof payload {
     HealthResponse             health = 10;
     RendererSpawnResponse      renderer_spawn = 11;
@@ -93,6 +103,8 @@ message Response {
     Empty                      playlist_activate = 37;
     Empty                      playlist_deactivate = 38;
     PlaylistStatusResponse     playlist_status = 39;
+    DisplayLayoutSetResponse   display_layout_set = 40;
+    GpuListResponse            gpu_list = 41;
   }
 }
 
@@ -102,6 +114,48 @@ enum Status {
   INVALID_ARGUMENT = 2;
   NOT_FOUND = 3;
   INTERNAL = 4;
+  FAILED_PRECONDITION = 5;
+}
+
+// Typed failure code carried on every `Response`. `ERROR_CODE_OK` (0) means
+// success; every non-OK value pin-points one specific failure category.
+// Numeric ranges are reserved per subsystem so codes can be added without
+// collisions: generic 1–99, renderer 100–199, wallpaper/source 200–299,
+// settings 300–399, library 400–499, playlist 500–599.
+enum ErrorCode {
+  ERROR_CODE_OK = 0;
+
+  // Generic / framing
+  ERROR_CODE_INTERNAL = 1;
+  ERROR_CODE_DECODE = 2;
+  ERROR_CODE_INVALID_ARGUMENT = 3;
+  ERROR_CODE_UNEXPECTED_PAYLOAD = 4;     // empty `Request.payload`
+  ERROR_CODE_FAILED_PRECONDITION = 5;
+  ERROR_CODE_DB = 6;
+
+  // Renderers
+  ERROR_CODE_RENDERER_NOT_FOUND = 100;
+  ERROR_CODE_RENDERER_SPAWN_FAILED = 101;
+  ERROR_CODE_RENDERER_CONTROL_FAILED = 102;
+  ERROR_CODE_NO_RENDERER_FOR_TYPE = 103;
+  ERROR_CODE_RENDERER_TYPE_MISMATCH = 104;
+
+  // Wallpapers / sources
+  ERROR_CODE_WALLPAPER_NOT_FOUND = 200;
+  ERROR_CODE_NO_DISPLAY_REGISTERED = 201;
+  ERROR_CODE_SOURCE_PLUGIN_NOT_FOUND = 202;
+  ERROR_CODE_SOURCE_EXTRAS_FAILED = 203;
+
+  // Settings
+  ERROR_CODE_SETTINGS_VALIDATION_FAILED = 300;
+  ERROR_CODE_SETTINGS_APPLY_FAILED = 301;
+
+  // Libraries
+  ERROR_CODE_LIBRARY_NOT_FOUND = 400;
+
+  // Playlists
+  ERROR_CODE_PLAYLIST_NOT_FOUND = 500;
+  ERROR_CODE_PLAYLIST_INVALID = 501;
 }
 
 message Empty {}
@@ -142,6 +196,12 @@ message RendererInstance {
   string status      = 3; // "playing" | "paused"
   string name        = 4; // renderer plugin name from RendererDef.name
   uint32 pid         = 5; // OS pid of the renderer child; 0 if unknown
+  // DRM render-node id of the GPU this renderer's Vulkan instance picked,
+  // sourced from its `Ready` event. Both 0 ⇒ unknown (driver lacks
+  // VK_EXT_physical_device_drm). UI cross-references against `GpuList` to
+  // show a human description.
+  uint32 drm_render_major = 6;
+  uint32 drm_render_minor = 7;
 }
 
 message RendererPlayRequest  { string renderer_id = 1; }
@@ -175,6 +235,38 @@ message RendererPluginInfo {
   repeated string types = 3;
   uint32 priority = 4;
   string version = 5;
+  // Per-setting schema entries derived from the manifest's
+  // `[renderer.settings.*]` table. UIs use these to render typed
+  // input widgets; daemon enforces validation independently before
+  // accepting a `SettingsSet`.
+  repeated SettingSchema settings = 6;
+}
+
+// Wire encoding of one `[renderer.settings.<key>]` row. All
+// numerics/defaults are stringified so the message stays uniform with
+// `PluginSettings.values` (also string→string). Empty `min`/`max`/`step`
+// = unset.
+message SettingSchema {
+  string key = 1;
+  SettingValueType type = 2;
+  string default_value = 3;
+  bool identity = 4;
+  string label_key = 5;
+  string description_key = 6;
+  string min = 7;
+  string max = 8;
+  string step = 9;
+  repeated string choices = 10;
+  string group = 11;
+  int32 order = 12;
+}
+
+enum SettingValueType {
+  SETTING_VALUE_TYPE_UNSPECIFIED = 0;
+  SETTING_VALUE_TYPE_U32 = 1;
+  SETTING_VALUE_TYPE_F32 = 2;
+  SETTING_VALUE_TYPE_STRING = 3;
+  SETTING_VALUE_TYPE_BOOL = 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +292,9 @@ message WallpaperListRequest {
   // pagination, return all entries matching wp_type".
   uint32 page = 2;
   uint32 page_size = 3;
+  reserved 4;
+  repeated WallpaperFilterRule filters = 5;
+  repeated FilterLogic filter_logics = 6;
 }
 message WallpaperListResponse {
   repeated WallpaperEntry wallpapers = 1;
@@ -211,7 +306,7 @@ message WallpaperListResponse {
 message WallpaperScanRequest {}
 // Ack-only — the rescan now runs asynchronously on the daemon. `count`
 // is `0` for newly-queued scans; the actual entry count arrives in the
-// later `WallpaperScanCompleted` server event so the UI does not have
+// later `WallpaperSyncFinished` server event so the UI does not have
 // to block on the response.
 message WallpaperScanResponse {
   uint32 count = 1;
@@ -235,6 +330,11 @@ message WallpaperApplyRequest {
   // resolved from settings (global default + plugin overrides), not from
   // this request.
   repeated uint64 display_ids = 5;
+  // Optional renderer plugin name. Empty (default) lets the daemon pick
+  // the highest-priority renderer registered for the wallpaper's type.
+  // Non-empty selects that exact renderer; the daemon validates that it
+  // is registered AND advertises this wallpaper's type.
+  string renderer_name = 6;
 }
 message WallpaperApplyResponse {
   string renderer_id = 1;
@@ -252,6 +352,68 @@ message DisplayLinkInfo {
   int32  z_order     = 2;
 }
 
+// Wallpaper fit policy. Values mirror Plasma's wallpaper plugin enum
+// (Stretched / PreserveAspectFit / PreserveAspectCrop / Tiled /
+// TiledOnlyHorizontally / TiledOnlyVertically / Centered) so the daemon
+// API maps 1:1 onto a future Plasma plugin. Tile* variants are
+// accepted but the daemon currently degrades them to
+// PRESERVE_ASPECT_FIT and logs a warning — the v1 set_config wire
+// can't express texture wrap in a single rect.
+enum FillMode {
+  FILL_MODE_UNSPECIFIED          = 0;
+  FILL_MODE_STRETCHED            = 1;
+  FILL_MODE_PRESERVE_ASPECT_FIT  = 2;
+  FILL_MODE_PRESERVE_ASPECT_CROP = 3;
+  FILL_MODE_TILED                = 4;
+  FILL_MODE_TILED_ONLY_HORIZONTAL = 5;
+  FILL_MODE_TILED_ONLY_VERTICAL   = 6;
+  FILL_MODE_CENTERED              = 7;
+}
+
+// 9-position alignment grid. Used by all FillMode values that don't
+// fully cover the display: positions the visible content within the
+// surface (PreserveAspectFit, Centered) or within the texture
+// (PreserveAspectCrop). Stretched ignores it.
+enum Align {
+  ALIGN_UNSPECIFIED   = 0;
+  ALIGN_TOP_LEFT      = 1;
+  ALIGN_TOP           = 2;
+  ALIGN_TOP_RIGHT     = 3;
+  ALIGN_LEFT          = 4;
+  ALIGN_CENTER        = 5;
+  ALIGN_RIGHT         = 6;
+  ALIGN_BOTTOM_LEFT   = 7;
+  ALIGN_BOTTOM        = 8;
+  ALIGN_BOTTOM_RIGHT  = 9;
+}
+
+// Resolved (or default) layout values. Used both for the global
+// default in `GlobalSettings.layout_defaults` and for the effective
+// layout broadcast back to clients on `DisplayInfo`.
+//
+// `clear_rgba` is a 4-element RGBA float array (sRGB straight alpha,
+// 0..=1). Empty array means "inherit / unset"; the daemon always
+// emits exactly 4 elements when it serializes an effective layout.
+message LayoutPrefs {
+  FillMode fillmode = 1;
+  Align    align    = 2;
+  repeated float clear_rgba = 3 [packed = true];
+}
+
+// Sparse per-display override. Each *_set flag, when true, indicates
+// that the matching field carries a real value; otherwise the field
+// is unset (= "inherit the global default"). Used on
+// `DisplayInfo.layout_override` and as the body of
+// `DisplayLayoutSetRequest`.
+message LayoutOverride {
+  bool fillmode_set = 1;
+  FillMode fillmode = 2;
+  bool align_set    = 3;
+  Align align       = 4;
+  bool clear_rgba_set = 5;
+  repeated float clear_rgba = 6 [packed = true];
+}
+
 message DisplayInfo {
   uint64 display_id  = 1;
   string name        = 2;
@@ -259,11 +421,58 @@ message DisplayInfo {
   uint32 height      = 4;
   uint32 refresh_mhz = 5;
   repeated DisplayLinkInfo links = 6;
+  // Resolved fillmode/align/clear_rgba currently in effect for this
+  // display (per-display override applied on top of the global
+  // defaults). UI binds to this for display.
+  LayoutPrefs effective_layout = 7;
+  // The raw per-display override (sparse). UI binds to this for the
+  // edit form so it can show "inherit" vs. explicit values.
+  LayoutOverride layout_override = 8;
+  // DRM render-node id of the GPU this display's consumer is on, sourced
+  // from `register_display` in the waywallen-display protocol. Both 0 ⇒
+  // unknown (the display backend did not query it). UI cross-references
+  // against `GpuList` to show a human description.
+  uint32 drm_render_major = 9;
+  uint32 drm_render_minor = 10;
 }
 
 message DisplayListRequest {}
 message DisplayListResponse {
   repeated DisplayInfo displays = 1;
+}
+
+// Mutate the per-display layout override for a single display. The
+// daemon writes through to its settings store and re-emits
+// `set_config` to the live consumer (if any) immediately. After the
+// write the daemon also broadcasts a `DisplayChanged` event so other
+// UIs see the new effective layout.
+//
+// Update semantics: each field is taken from the override message
+// only when its matching `*_set` flag is true. To clear (revert to
+// global default), set the field's `*_set` flag false in the new
+// override AND set the corresponding `clear_*` flag below to true.
+// Sending an unspecified override leaves the override entry untouched.
+message DisplayLayoutSetRequest {
+  // Display name as advertised in `register_display`.
+  string name = 1;
+  // New override values. Field set/unset behavior follows the
+  // `LayoutOverride` message rules.
+  LayoutOverride override = 2;
+  // Explicit "remove this field from the override" flags. They take
+  // precedence over `override.*_set` when both are present (set+clear
+  // resolves to clear). Useful for UI that wants to revert a single
+  // field to the global default without sending the full override.
+  bool clear_fillmode = 3;
+  bool clear_align    = 4;
+  bool clear_clear_rgba = 5;
+}
+
+message DisplayLayoutSetResponse {
+  // Updated DisplayInfo for the affected display (with refreshed
+  // `effective_layout`). Empty if the display name was not registered
+  // at the time of the call — the override is still persisted and
+  // takes effect when the display next registers.
+  DisplayInfo display = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,23 +523,37 @@ message Event {
     LibrarySnapshot        library_snapshot          = 7;
     LibraryChanged         library_changed           = 8;
     LibraryRemoved         library_removed           = 9;
-    WallpaperScanStarted   wallpaper_scan_started    = 10;
-    WallpaperScanCompleted wallpaper_scan_completed  = 11;
+    WallpaperSyncFinished  wallpaper_sync_finished   = 11;
     LibrariesAdded         libraries_added           = 12;
     StatusSync             status_sync               = 13;
+    SettingsChanged        settings_changed          = 14;
   }
 }
 
+// Coarse daemon lifecycle. Orthogonal to `StatusSync.scan_in_progress`.
+enum DaemonPhase {
+  DAEMON_PHASE_UNSPECIFIED = 0;
+  // Booting: WS may already accept connections, but the UI should
+  // avoid firing queries (data may be empty / settings may still be
+  // reconciling). Show a startup dialog instead.
+  DAEMON_PHASE_STARTING = 1;
+  // Core services are up (WS bound, DBus published). UI can query.
+  // A scan may still be running — that's `scan_in_progress`.
+  DAEMON_PHASE_READY = 2;
+}
+
 // Snapshot of daemon-side runtime state. Pushed on WS connect and on
-// every change that affects any field (scan transitions, task
-// lifecycle). Authoritative — start/end events are best-effort
-// notifications, but `StatusSync` is the field UI binds to for
-// closed-loop state (e.g. spinner visibility).
+// every change that affects any field (phase, scan, task lifecycle).
+// Authoritative — transient events are best-effort notifications, but
+// `StatusSync` is the field UI binds to for closed-loop state (e.g.
+// spinner visibility, startup dialog).
 message StatusSync {
   // True while a wallpaper rescan (`refresh_sources`) is in flight.
   bool scan_in_progress = 1;
   // Count of TaskManager tasks currently in `Running` state.
   uint32 active_task_count = 2;
+  // Daemon lifecycle phase. UI gates the startup dialog on this.
+  DaemonPhase phase = 3;
 }
 
 // One or more libraries were just added — by `LibraryAdd` (one path)
@@ -340,16 +563,12 @@ message LibrariesAdded {
   repeated string paths = 1;
 }
 
-// A wallpaper rescan has started on the daemon (manual via
-// `WallpaperScan`, or automatic after `LibraryAdd`/`LibraryRemove` /
-// at startup). UI may show a transient "scanning…" affordance.
-message WallpaperScanStarted {}
-
-// A wallpaper rescan finished. `count` is the total entry count after
+// A wallpaper sync finished. `count` is the total entry count after
 // the swap; `error` is empty on success, otherwise a one-line reason.
 // UI typically reacts with a `Notify` toast and a `WallpaperList`
 // refetch — daemon does not push the list itself, only the trigger.
-message WallpaperScanCompleted {
+// Sync start is observable via `StatusSync.scan_in_progress`.
+message WallpaperSyncFinished {
   uint32 count = 1;
   string error = 2;
 }
@@ -408,11 +627,48 @@ message LibraryRemoved {
 // Settings
 // ---------------------------------------------------------------------------
 
+// How the daemon shapes the (extent_w, extent_h, extent_mode) hint it
+// hands to a renderer's Init request. Mirrors
+// `crate::settings::RenderSizePolicy`. The daemon does not know the
+// wallpaper's intrinsic resolution, so for everything except `NATIVE`
+// the renderer is responsible for filling the unspecified axis using
+// `<waywallen-bridge/extent_resolve.h>`.
+enum RenderSizePolicy {
+  // Reserve 0 for a default that survives proto3 wire skipping for
+  // older clients; `ONE_AXIS_AUTO` matches the daemon-side default.
+  RENDER_SIZE_POLICY_ONE_AXIS_AUTO    = 0;
+  RENDER_SIZE_POLICY_NATIVE           = 1;
+  RENDER_SIZE_POLICY_ONE_AXIS_WIDTH   = 2;
+  RENDER_SIZE_POLICY_ONE_AXIS_HEIGHT  = 3;
+}
+
 message GlobalSettings {
-  uint32 default_width  = 1;
-  uint32 default_height = 2;
+  // Tag 1 / 2 used to be `default_width`/`default_height`; replaced by
+  // `target_extent` + `render_size_policy` in v7. Keep the old tag
+  // numbers reserved so older clients don't accidentally re-bind them
+  // to incompatible meanings.
+  reserved 1, 2;
+  reserved "default_width", "default_height";
+
+  // Pixel value applied to whichever axis (or both) the policy
+  // designates. Ignored when `render_size_policy = NATIVE`.
+  uint32 target_extent = 4;
+  RenderSizePolicy render_size_policy = 5;
+  // Structured wallpaper-browser filter state. The daemon persists it
+  // internally as JSON, but the control plane stays structured so the
+  // UI never has to serialize/parse the editor state itself.
+  repeated WallpaperFilterRule wallpaper_filters = 6;
+  repeated FilterLogic wallpaper_filter_logics = 7;
+
   // Note: fps is per-plugin (in PluginSettings) — different renderer
   // engines have different sane defaults, so it's not a global field.
+  //
+  // Daemon-wide layout defaults applied when a display has no
+  // per-display override. UI sends these as the "default for new
+  // displays" preset. `clear_rgba` may be empty in `SettingsSetRequest`
+  // — the daemon then falls back to opaque black [0,0,0,1]; in
+  // `SettingsGetResponse` the daemon always emits exactly 4 floats.
+  LayoutPrefs layout_defaults = 3;
 }
 
 // One plugin's settings table. Wire format is string→string for
@@ -431,6 +687,16 @@ message SettingsGetResponse {
 // Full replace. The daemon overwrites global and the plugin map with
 // what's sent here. Plugins not present in the request are removed.
 message SettingsSetRequest {
+  GlobalSettings global = 1;
+  map<string, PluginSettings> plugins = 2;
+}
+
+// Server-initiated push: the persisted settings just changed. Carries
+// the full post-write state so a UI can rebind without a follow-up
+// `SettingsGetRequest`. Sent after every successful `SettingsSet` and
+// after schema-driven startup reconciliation that filled in defaults
+// or dropped unknown keys.
+message SettingsChanged {
   GlobalSettings global = 1;
   map<string, PluginSettings> plugins = 2;
 }
@@ -532,4 +798,32 @@ message PlaylistStatusResponse {
   uint32       position = 5;
   uint32       count = 6;
   bool         is_smart = 7;
+}
+
+// ---------------------------------------------------------------------------
+// GPU enumeration
+// ---------------------------------------------------------------------------
+//
+// Snapshot of the host's DRM devices. Daemon walks /dev/dri + sysfs at
+// startup (see `gpu::enumerate`) and caches the result; this message
+// surfaces it to the UI. Pair with `RendererInstance.drm_render_major/minor`
+// and `DisplayInfo.drm_render_major/minor` to label which GPU each
+// renderer / display is currently on.
+message GpuInfo {
+  string render_node    = 1;   // empty if no render node (rare: vgem etc.)
+  string primary_node   = 2;   // empty if no primary node
+  uint32 render_major   = 3;
+  uint32 render_minor   = 4;
+  uint32 primary_major  = 5;
+  uint32 primary_minor  = 6;
+  string pci_bdf        = 7;   // "0000:03:00.0" — empty if not a PCI device
+  uint32 vendor_id      = 8;   // PCI vendor (0x1002 / 0x10de / 0x8086 …)
+  uint32 device_id      = 9;   // PCI device
+  string driver         = 10;  // kernel driver basename: "amdgpu" / "i915" / "nvidia"
+  string description    = 11;  // best-effort human label
+}
+
+message GpuListRequest {}
+message GpuListResponse {
+  repeated GpuInfo gpus = 1;
 }

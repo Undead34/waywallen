@@ -17,8 +17,8 @@ namespace proto = waywallen::control::v1;
 
 auto app_instance(waywallen::App* in = nullptr) -> waywallen::App* {
     static waywallen::App* instance { in };
-    assert(instance != nullptr, "app object not inited");
-    assert(in == nullptr || instance == in, "there should be only one app object");
+    rstd_assert(instance != nullptr, "app object not inited");
+    rstd_assert(in == nullptr || instance == in, "there should be only one app object");
     return instance;
 }
 
@@ -93,31 +93,36 @@ void App::init() {
 
     // Resolve ws port. Priority: explicit --ws-port override > DBus-discovered.
     auto* dbus = DaemonDBusClient::instance();
-    if (d->m_port == 0) {
+    if (d->m_port == 0 && dbus->status() == DaemonDBusClient::Connected) {
         quint16 p = dbus->wsPort();
         if (p != 0) {
             d->m_backend->setPort(p);
         }
     }
 
-    // React to daemon availability / port changes.
-    connect(dbus, &DaemonDBusClient::wsPortChanged, this, [this, d](quint16 port) {
+    // React to daemon availability / port changes. The backend is only
+    // (re)configured when the daemon reports `Connected` — VersionMissing
+    // and VersionMismatch hold the backend disconnected even if a port
+    // value is in hand, since the wire contract isn't trusted.
+    auto sync_backend = [this, d, dbus]() {
         if (d->m_port != 0) {
-            // Explicit override from CLI; ignore DBus-driven port changes.
+            // Explicit override from CLI; ignore DBus-driven changes.
             return;
         }
+        if (dbus->status() != DaemonDBusClient::Connected) {
+            d->m_backend->disconnect();
+            return;
+        }
+        const quint16 port = dbus->wsPort();
         if (port == 0) {
             d->m_backend->disconnect();
             return;
         }
         d->m_backend->setPort(port);
         d->m_backend->connectTo();
-    });
-    connect(dbus, &DaemonDBusClient::daemonAvailabilityChanged, this, [d](bool available) {
-        if (! available) {
-            d->m_backend->disconnect();
-        }
-    });
+    };
+    connect(dbus, &DaemonDBusClient::wsPortChanged, this, sync_backend);
+    connect(dbus, &DaemonDBusClient::statusChanged, this, sync_backend);
 
     d->m_display_mgr->attachTo(d->m_backend.get());
     d->m_renderer_mgr->attachTo(d->m_backend.get());
@@ -154,7 +159,7 @@ void App::init() {
         }
     }
 
-    assert(d->m_main_win, "main window must exist");
+    rstd_assert(d->m_main_win, "main window must exist");
 }
 
 auto App::engine() const -> QQmlApplicationEngine* {

@@ -35,14 +35,19 @@ using proto::RendererKillRequest;
 using proto::RendererPluginListRequest;
 using proto::RendererPluginListResponse;
 using proto::RendererPluginInfo;
+using proto::SettingSchema;
 
 using proto::WallpaperEntry;
 using proto::WallpaperListRequest;
 using proto::WallpaperListResponse;
 using proto::WallpaperScanRequest;
 using proto::WallpaperScanResponse;
+using proto::WallpaperSyncFinished;
 using proto::WallpaperApplyRequest;
 using proto::WallpaperApplyResponse;
+
+using proto::StatusSync;
+using proto::DaemonPhaseGadget::DaemonPhase;
 
 using proto::SourceListRequest;
 using proto::SourceListResponse;
@@ -52,6 +57,9 @@ using proto::DisplayInfo;
 using proto::DisplayLinkInfo;
 using proto::DisplayListRequest;
 using proto::DisplayListResponse;
+using proto::LayoutOverride;
+using proto::DisplayLayoutSetRequest;
+using proto::DisplayLayoutSetResponse;
 
 using proto::LibraryInstance;
 using proto::LibraryListRequest;
@@ -63,4 +71,27 @@ using proto::LibraryAutoDetectResponse;
 using proto::LibrarySnapshot;
 using proto::LibraryChanged;
 using proto::LibraryRemoved;
+
+using proto::GlobalSettings;
+using proto::PluginSettings;
+using proto::SettingsGetRequest;
+using proto::SettingsGetResponse;
+using proto::SettingsSetRequest;
+using proto::SettingsChanged;
+using proto::LayoutPrefs;
+using proto::FillModeGadget::FillMode;
+using proto::AlignGadget::Align;
+using proto::RenderSizePolicyGadget::RenderSizePolicy;
+
+using proto::WallpaperFilterRule;
+using proto::WallpaperFilterTypeGadget::WallpaperFilterType;
+using proto::WallpaperStringFilter;
+using proto::WallpaperIntFilter;
+using proto::WallpaperAspectFilter;
+using proto::StringConditionGadget::StringCondition;
+using proto::IntConditionGadget::IntCondition;
+using proto::TypeConditionGadget::TypeCondition;
+using proto::LogicOpGadget::LogicOp;
+using proto::FilterLogic;
+using proto::WallpaperAspectGadget::WallpaperAspect;
 } // namespace waywallen::control::v1

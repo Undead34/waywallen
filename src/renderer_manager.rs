@@ -5,7 +5,7 @@
 //! This module is the Rust daemon's counterpart to the C++ host program
 //! in `open-wallpaper-engine/host/`.
 
-use anyhow::{anyhow, Context, Result};
+use crate::error::{Error, Result, ResultExt};
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -20,6 +20,11 @@ use uuid::Uuid;
 
 use crate::ipc::proto::{ControlMsg, EventMsg};
 use crate::ipc::uds::{recv_event, send_control, CodecError};
+
+/// Spawn-time `Init` payload version the daemon currently emits. Bump
+/// this when the wire shape of `ControlMsg::Init` changes; renderers
+/// reply with `EventMsg::InitNack` if they don't recognise the value.
+pub const SPAWN_VERSION: u32 = 4;
 use crate::plugin::renderer_registry::{RendererDef, RendererRegistry};
 use crate::routing::Router;
 use crate::wallpaper_type::WallpaperType;
@@ -34,19 +39,39 @@ pub type RendererId = String;
 pub struct SpawnRequest {
     /// The wallpaper type determines which renderer binary is spawned.
     pub wp_type: WallpaperType,
-    /// Type-specific key-value data forwarded as CLI args to the renderer.
-    /// For "scene": {"scene": "<pkg>", "assets": "<dir>"}.
-    /// For "image": {"path": "<file>"}.
-    pub metadata: HashMap<String, String>,
+    /// CLI argv dictionary the daemon turns into `--<key> <value>`
+    /// pairs after `--ipc <socket>`. Source plugins fill this via
+    /// `extras(entry)`; `extras["path"]` is the canonical resource
+    /// (mandatory). Plugin-specific keys (`assets`, `workshop_id`, …)
+    /// must be ⊆ the renderer manifest's `extras` whitelist + `path`.
+    pub extras: HashMap<String, String>,
+    /// Plugin settings kv that flows directly into `Init.settings`.
+    /// The caller is responsible for sourcing this — typically the
+    /// reconciled per-plugin section of the daemon's settings store.
+    /// Identity-tagged keys (per the manifest schema) gate reuse;
+    /// non-identity keys can be hot-applied via `ApplySettings`.
+    pub settings: HashMap<String, String>,
+    /// Hint to the renderer for one or both render-target axes. `0` on
+    /// either axis means "renderer fills this in from native". See
+    /// `extent_mode` for the interpretation.
     pub width: u32,
     pub height: u32,
-    pub fps: u32,
+    /// Wire-level interpretation of `width`/`height`; values match
+    /// `crate::settings::extent_mode::*` (and `ww_extent_mode_t` in
+    /// the C bridge). `0` = `AS_GIVEN`.
+    pub extent_mode: u32,
     /// When true, pass `--test-pattern` to the renderer host, which
     /// bypasses `SceneWallpaper::loadScene` and drives the offscreen
     /// ExSwapchain ring on a host-owned timer. Used to bring up the
     /// full daemon/display pipeline before a real Wallpaper Engine
     /// assets directory is available (see plan.md I4).
     pub test_pattern: bool,
+    /// Optional explicit renderer plugin name. `None` (default) lets
+    /// `spawn` and `find_reusable` pick the highest-priority renderer
+    /// for `wp_type`; `Some(name)` pins both to that exact plugin so a
+    /// user-chosen non-default renderer isn't transparently swapped
+    /// for the priority winner on reuse or fresh spawn.
+    pub renderer_name: Option<String>,
 }
 
 /// Snapshot of the most recent `BindBuffers` event, plus the DMA-BUF FDs
@@ -125,12 +150,20 @@ pub struct RendererHandle {
     pub wp_type: WallpaperType,
     pub width: u32,
     pub height: u32,
-    pub fps: u32,
-    /// The `SpawnRequest.metadata` this renderer was started with.
-    /// Retained so the manager can deduplicate a subsequent spawn
-    /// request that would produce an identical renderer — see
-    /// `RendererManager::find_reusable`.
-    pub metadata: HashMap<String, String>,
+    /// Mirrors `SpawnRequest.extent_mode` so reuse can distinguish two
+    /// requests that share the same `width`/`height` but disagree on
+    /// the daemon's interpretation hint.
+    pub extent_mode: u32,
+    /// The `SpawnRequest.extras` this renderer was started with —
+    /// canonical resource path + manifest-allowlisted keys
+    /// (`assets`, `workshop_id`, …) that ride on CLI argv. This is
+    /// the per-spawn identity differentiator: two SpawnRequests of
+    /// the same plugin / wp_type / extent that disagree on `extras`
+    /// MUST get different renderer processes (different `path` =
+    /// different wallpaper). Settings, by contrast, are plugin-wide
+    /// (`Settings::plugin(&name)`) and shared across all renderers
+    /// of a plugin, so they don't differentiate.
+    pub extras: HashMap<String, String>,
     /// Renderer plugin name from the resolved `RendererDef` (e.g.
     /// `"wescene"`). Surfaced to the UI so users see a friendly
     /// `<name>-<pid>` label instead of the opaque UUID.
@@ -197,14 +230,13 @@ pub struct RendererHandle {
     /// implement Iter 2 yet leave it empty, in which case the
     /// daemon skips negotiation for them and Iter 1 behavior
     /// (blind forward) prevails.
-    format_caps: Arc<StdMutex<Option<crate::negotiate::PeerCaps>>>,
+    format_caps: Arc<StdMutex<Option<crate::dma::negotiate::PeerCaps>>>,
 
     /// Last `NegotiatedScheme` the daemon dispatched via
     /// `NegotiateBuffers` to this renderer. Used for idempotence in
     /// `send_negotiate_buffers` — repeat calls with the same scheme
     /// short-circuit. `None` until the first dispatch.
-    last_dispatched_scheme:
-        Arc<StdMutex<Option<crate::negotiate::NegotiatedScheme>>>,
+    last_dispatched_scheme: Arc<StdMutex<Option<crate::dma::negotiate::NegotiatedScheme>>>,
 
     /// Sink for per-frame [`crate::sync::FrameRecord`]s. The display
     /// endpoint pushes one record per consumer per frame; the reaper
@@ -216,6 +248,13 @@ pub struct RendererHandle {
 
     /// The child process. Kept alive so dropping the manager reaps it.
     child: Arc<TokioMutex<Option<Child>>>,
+
+    /// Inbound-event family subscriptions copied from the renderer's
+    /// manifest at spawn time. Pointer-event senders consult this to
+    /// decide whether to encode (subscribed) or silently drop. Strings
+    /// are validated against the recognised set in
+    /// `RendererRegistry::scan`.
+    events_subscribed: Arc<Vec<String>>,
 }
 
 impl RendererHandle {
@@ -227,6 +266,21 @@ impl RendererHandle {
     /// first frame has been rendered and the fds arrived.
     pub fn bind_snapshot(&self) -> Arc<StdMutex<Option<BindSnapshot>>> {
         Arc::clone(&self.bind_snapshot)
+    }
+
+    /// Actual texture dimensions reported by the renderer's most recent
+    /// `BindBuffers`. Falls back to the spawn-time `(width, height)`
+    /// hint until the first BindBuffers arrives — the spawn-time hint
+    /// is just `Init.extent_w/h`, which after the renderer resolves
+    /// it against the wallpaper's intrinsic size may not match the
+    /// actual buffer dims.
+    pub fn texture_size(&self) -> (u32, u32) {
+        if let Ok(g) = self.bind_snapshot.lock() {
+            if let Some(snap) = g.as_ref() {
+                return (snap.width, snap.height);
+            }
+        }
+        (self.width, self.height)
     }
 
     /// Current placement flags from the latest `BindBuffers`, or 0 if
@@ -287,7 +341,7 @@ impl RendererHandle {
     /// arrived (or forever, for renderers that haven't been ported to
     /// Iter 2). The router calls this on every reconcile pass; it's
     /// cheap (cloning a HashMap of small structs).
-    pub fn format_caps(&self) -> Option<crate::negotiate::PeerCaps> {
+    pub fn format_caps(&self) -> Option<crate::dma::negotiate::PeerCaps> {
         self.format_caps.lock().ok().and_then(|g| g.clone())
     }
 
@@ -310,17 +364,17 @@ impl RendererHandle {
         caps.blacklist.insert((fourcc, modifier))
     }
 
-    /// Most recently dispatched [`crate::negotiate::NegotiatedScheme`]
+    /// Most recently dispatched [`crate::dma::negotiate::NegotiatedScheme`]
     /// for this renderer. `None` until the daemon has run a successful
     /// `pick` and called `send_negotiate_buffers`. Used by the router
     /// to gate `Bind`/`Frame` dispatch — frames are silently held
     /// until `bind_snapshot` matches the dispatched scheme.
-    pub fn current_scheme(&self) -> Option<crate::negotiate::NegotiatedScheme> {
+    pub fn current_scheme(&self) -> Option<crate::dma::negotiate::NegotiatedScheme> {
         self.last_dispatched_scheme.lock().ok().and_then(|g| *g)
     }
 
     /// True iff the renderer's most recent `BindBuffers` snapshot
-    /// matches the most recently dispatched [`crate::negotiate::NegotiatedScheme`]
+    /// matches the most recently dispatched [`crate::dma::negotiate::NegotiatedScheme`]
     /// on `(fourcc, modifier)`. Returns `false` if either side is
     /// missing — the gate stays closed until both arrive. Caller is
     /// responsible for ensuring v2 negotiation actually applies (i.e.
@@ -372,6 +426,11 @@ pub struct RendererManager {
     /// unlinked from the routing table in lockstep with being evicted
     /// from our map.
     router: OnceLock<StdWeak<Router>>,
+    /// Cached `/dev/dri` enumeration from startup. Used at spawn time to
+    /// translate per-plugin `gpu_drm_dev = "<major>:<minor>"` settings into
+    /// a `render_node` path injected into `Init.settings`. Empty vec if
+    /// `attach_gpus` was never called (test stub).
+    gpus: OnceLock<Arc<Vec<crate::gpu::GpuInfo>>>,
     /// Dead-renderer signals queue here (from reader-thread exit or
     /// a send_control hitting EPIPE). A single background reaper task
     /// drains the channel and runs the async `evict` — routing it
@@ -395,9 +454,17 @@ impl RendererManager {
             }),
             registry,
             router: OnceLock::new(),
+            gpus: OnceLock::new(),
             reap_tx,
             reap_rx: StdMutex::new(Some(reap_rx)),
         }
+    }
+
+    /// Hand the manager the startup `/dev/dri` snapshot so spawn-time can
+    /// resolve `gpu_drm_dev` selections into `render_node` paths.
+    /// Idempotent: further calls are no-ops.
+    pub fn attach_gpus(&self, gpus: Arc<Vec<crate::gpu::GpuInfo>>) {
+        let _ = self.gpus.set(gpus);
     }
 
     /// Wire the manager to the router. Must be called once after both
@@ -436,9 +503,12 @@ impl RendererManager {
                 name: "test-scene".to_string(),
                 bin: PathBuf::from(bin),
                 types: vec!["scene".to_string()],
-                extra_args: vec![],
                 priority: 100,
                 version: "v0.0.0".to_string(),
+                spawn_version: None,
+                extras: Vec::new(),
+                settings: Default::default(),
+                events: Vec::new(),
             });
         }
         Self::new(registry)
@@ -452,7 +522,7 @@ impl RendererManager {
     /// Spawn a fresh renderer-host subprocess, wait for its `Ready`
     /// event, and return its id. Fails (and cleans up the child) if the
     /// host doesn't come online within `timeout`.
-    pub async fn spawn(&self, req: SpawnRequest) -> Result<RendererId> {
+    pub async fn spawn(&self, mut req: SpawnRequest) -> Result<RendererId> {
         let id: RendererId = Uuid::new_v4().to_string();
 
         // Create a listening UDS at a temp path; the child connects to
@@ -466,31 +536,63 @@ impl RendererManager {
         // the connection survives unlink(2).
         let _cleanup = TempUnlink(sock_path.clone());
 
-        let renderer_def = self
-            .registry
-            .resolve(&req.wp_type)
-            .ok_or_else(|| anyhow!("no renderer registered for type '{}'", req.wp_type))?
-            .clone();
+        let renderer_def = match req.renderer_name.as_deref() {
+            Some(name) => self
+                .registry
+                .resolve_by_name(name)
+                .ok_or_else(|| Error::RendererNotFound(name.to_string()))?
+                .clone(),
+            None => self
+                .registry
+                .resolve(&req.wp_type)
+                .ok_or_else(|| Error::NoRendererForType(req.wp_type.clone()))?
+                .clone(),
+        };
+
+        // Translate the user's GPU choice into a render_node path before
+        // it reaches the subprocess: plugin settings persist
+        // `gpu_drm_dev = "<major>:<minor>"` (mirroring drm_render_major/
+        // minor on the wire); the subprocess contract consumes
+        // `render_node` (a path). On a hit we inject render_node and
+        // strip gpu_drm_dev from the kv we ship. On a miss (defensive —
+        // startup reconcile should have already cleared it) we leave
+        // both out and let the subprocess pick a default device.
+        if let Some(raw) = req.settings.remove(crate::gpu::GPU_DRM_DEV_KEY) {
+            if let Some((major, minor)) = crate::gpu::parse_drm_dev(&raw) {
+                let resolved = self
+                    .gpus
+                    .get()
+                    .and_then(|gs| gs.iter().find(|g| g.matches_render(major, minor)))
+                    .and_then(|g| g.render_node.as_ref())
+                    .and_then(|p| p.to_str().map(str::to_string));
+                if let Some(path) = resolved {
+                    req.settings
+                        .insert(crate::gpu::RENDER_NODE_KEY.to_string(), path);
+                } else {
+                    log::warn!(
+                        "spawn: gpu_drm_dev={raw} not in /dev/dri enumeration; \
+                         dropping selection and letting renderer pick default"
+                    );
+                }
+            } else {
+                log::warn!("spawn: gpu_drm_dev={raw:?} not parseable as <major>:<minor>");
+            }
+        }
+
+        // Build the Init message *before* spawning the child (no
+        // orphan socket file lingering past TempUnlink if anything
+        // goes wrong later).
+        let init_msg = build_init_msg(&req, &renderer_def);
 
         let mut cmd = Command::new(&renderer_def.bin);
-        cmd.arg("--ipc")
-            .arg(&sock_path)
-            .arg("--width")
-            .arg(req.width.to_string())
-            .arg("--height")
-            .arg(req.height.to_string())
-            .arg("--fps")
-            .arg(req.fps.to_string());
-        // Forward type-specific metadata as --key value CLI args.
-        for (key, value) in &req.metadata {
-            cmd.arg(format!("--{key}")).arg(value);
-        }
-        // Append extra_args from the renderer manifest.
-        for arg in &renderer_def.extra_args {
-            cmd.arg(arg);
-        }
-        if req.test_pattern {
-            cmd.arg("--test-pattern");
+        cmd.arg("--ipc").arg(&sock_path);
+        // SPAWN_VERSION 3: extras (canonical `path` + plugin-specific
+        // keys like `assets`/`workshop_id`) ride as `--<key> <value>`
+        // CLI argv. Sorted for spawn-command determinism.
+        let mut extra_keys: Vec<&String> = req.extras.keys().collect();
+        extra_keys.sort();
+        for k in extra_keys {
+            cmd.arg(format!("--{k}")).arg(&req.extras[k]);
         }
         cmd.kill_on_drop(true)
             .stdout(Stdio::inherit())
@@ -507,49 +609,39 @@ impl RendererManager {
             .await
             .map_err(|_| {
                 let _ = child.start_kill();
-                anyhow!("timed out waiting for waywallen-renderer to connect back")
+                Error::RendererSpawnFailed(
+                    "timed out waiting for waywallen-renderer to connect back".into(),
+                )
             })?
             .context("accept")?;
 
         // Convert to a blocking std UnixStream for the rest of the
         // lifecycle: the ipc::uds helpers use nix sendmsg/recvmsg which
         // need a real blocking fd.
-        let std_stream = tokio_stream
-            .into_std()
-            .context("UnixStream::into_std")?;
+        let std_stream = tokio_stream.into_std().context("UnixStream::into_std")?;
         std_stream
             .set_nonblocking(false)
             .context("clear O_NONBLOCK on accepted stream")?;
 
-        // Read the host's initial `Ready` event synchronously so we
-        // can fail spawn() with a clear error if initVulkan blew up.
-        let ready_stream = std_stream
+        // Step 1 of the renderer-Init refactor: emit the typed Init
+        // message right after accept(). The legacy CLI argv block above
+        // is still in place; renderers that have not yet been switched
+        // to consume Init simply ignore it. Send + Ready/InitNack recv
+        // is factored into `run_init_handshake` so the unit test can
+        // drive it over a socketpair without going through spawn().
+        // (`init_msg` was built above before spawn so a schema error
+        // fails before the child process is created.)
+        let handshake_stream = std_stream
             .try_clone()
-            .context("try_clone for Ready poll")?;
-        let ready: (EventMsg, Vec<OwnedFd>) = tokio::task::spawn_blocking(move || {
-            recv_event(&ready_stream).map_err(|e| anyhow!("recv Ready: {e}"))
-        })
-        .await
-        .context("ready poll join")??;
-        let gpu = match ready.0 {
-            EventMsg::Ready {
-                drm_render_major,
-                drm_render_minor,
-            } => DrmNode {
-                major: drm_render_major,
-                minor: drm_render_minor,
-            },
-            other => {
-                let _ = child.start_kill();
-                return Err(anyhow!(
-                    "host emitted {:?} before Ready; aborting spawn",
-                    other
-                ));
-            }
-        };
-        if !ready.1.is_empty() {
-            log::warn!("Ready unexpectedly carried {} fds; dropping", ready.1.len());
-        }
+            .context("try_clone for Init handshake")?;
+        let gpu =
+            tokio::task::spawn_blocking(move || run_init_handshake(&handshake_stream, &init_msg))
+                .await
+                .context("init handshake join")?
+                .map_err(|e| {
+                    let _ = child.start_kill();
+                    e
+                })?;
         log::info!(
             "renderer {id}: Ready (drm_render={}:{})",
             gpu.major,
@@ -558,13 +650,11 @@ impl RendererManager {
 
         // Now wire up the permanent reader thread and store the handle.
         let (events_tx, _events_rx) = broadcast::channel::<EventMsg>(256);
-        let bind_snapshot: Arc<StdMutex<Option<BindSnapshot>>> =
-            Arc::new(StdMutex::new(None));
+        let bind_snapshot: Arc<StdMutex<Option<BindSnapshot>>> = Arc::new(StdMutex::new(None));
         let sync_fds: Arc<StdMutex<std::collections::VecDeque<(u64, OwnedFd)>>> =
             Arc::new(StdMutex::new(std::collections::VecDeque::new()));
-        let release_syncobj: Arc<StdMutex<Option<OwnedFd>>> =
-            Arc::new(StdMutex::new(None));
-        let format_caps: Arc<StdMutex<Option<crate::negotiate::PeerCaps>>> =
+        let release_syncobj: Arc<StdMutex<Option<OwnedFd>>> = Arc::new(StdMutex::new(None));
+        let format_caps: Arc<StdMutex<Option<crate::dma::negotiate::PeerCaps>>> =
             Arc::new(StdMutex::new(None));
         let pending_configure: Arc<StdMutex<Option<u32>>> = Arc::new(StdMutex::new(None));
 
@@ -617,8 +707,8 @@ impl RendererManager {
             wp_type: req.wp_type.clone(),
             width: req.width,
             height: req.height,
-            fps: req.fps,
-            metadata: req.metadata.clone(),
+            extent_mode: req.extent_mode,
+            extras: req.extras.clone(),
             name: renderer_def.name.clone(),
             pid: child_pid,
             gpu,
@@ -632,6 +722,7 @@ impl RendererManager {
             frame_record_tx,
             pending_configure,
             child: Arc::new(TokioMutex::new(Some(child))),
+            events_subscribed: Arc::new(renderer_def.events.clone()),
         });
 
         if handle.frame_record_tx.is_some() {
@@ -656,25 +747,49 @@ impl RendererManager {
             let mut inner = self.inner.lock().await;
             inner.renderers.insert(id.clone(), handle);
         }
-        log::info!("spawned renderer {id} ({}x{} @ {} fps)", req.width, req.height, req.fps);
+        log::info!("spawned renderer {id} ({}x{})", req.width, req.height);
         Ok(id)
     }
 
-    /// Find an already-running renderer whose spawn parameters match
-    /// `req` (wp_type, metadata, width, height, fps, test_pattern).
-    /// Returns its id so callers can relink displays to it instead of
-    /// spawning a duplicate. `None` if no match exists.
+    /// Find an already-running renderer whose **identity** matches
+    /// `req` and the resolved manifest schema, ignoring runtime-tunable
+    /// (`identity = false`) settings. Returns the id plus a delta of
+    /// runtime-only metadata that differs from the live renderer's
+    /// current `runtime_settings` cache, plus an optional new fps when
+    /// the manifest declares fps as a runtime setting (or for reusable
+    /// mismatches against the typed `req.fps`, see below).
+    ///
+    /// Reuse a live renderer when:
+    ///   - structural: `wp_type` / `width` / `height` / `extent_mode` /
+    ///     resolved renderer plugin name all match.
+    ///   - per-spawn: `extras` matches (different `path` ⇒ different
+    ///     wallpaper ⇒ different renderer process).
+    ///
+    /// Plugin settings live in `Settings::plugin(&name)` and are
+    /// pushed live to all renderers by `SettingsSet`. The renderer
+    /// applies what it can; whatever it can't apply live takes effect
+    /// on the next spawn (via the fresh `Init.settings`). Returns
+    /// `None` when no live renderer matches.
     pub async fn find_reusable(&self, req: &SpawnRequest) -> Option<RendererId> {
+        let def = match req.renderer_name.as_deref() {
+            Some(name) => self.registry.resolve_by_name(name)?.clone(),
+            None => self.registry.resolve(&req.wp_type)?.clone(),
+        };
+
         let inner = self.inner.lock().await;
         for (id, h) in inner.renderers.iter() {
-            if h.wp_type == req.wp_type
-                && h.width == req.width
-                && h.height == req.height
-                && h.fps == req.fps
-                && h.metadata == req.metadata
+            if h.wp_type != req.wp_type
+                || h.width != req.width
+                || h.height != req.height
+                || h.extent_mode != req.extent_mode
+                || h.name != def.name
             {
-                return Some(id.clone());
+                continue;
             }
+            if h.extras != req.extras {
+                continue;
+            }
+            return Some(id.clone());
         }
         None
     }
@@ -698,13 +813,13 @@ impl RendererManager {
         let handle = self
             .get(id)
             .await
-            .ok_or_else(|| anyhow!("unknown renderer: {id}"))?;
+            .ok_or_else(|| Error::RendererNotFound(id.to_string()))?;
         let sock = handle.sock.clone();
         let codec_res: Result<std::result::Result<(), CodecError>> =
             tokio::task::spawn_blocking(move || {
-                let guard = sock
-                    .lock()
-                    .map_err(|e| anyhow!("sock mutex poisoned: {e}"))?;
+                let guard = sock.lock().map_err(|e| {
+                    Error::RendererControlFailed(format!("sock mutex poisoned: {e}"))
+                })?;
                 Ok(send_control(&*guard, &msg, &[]))
             })
             .await
@@ -716,7 +831,7 @@ impl RendererManager {
                     log::warn!("renderer {id}: peer gone on send_control ({e}), evicting");
                     self.mark_dead(id);
                 }
-                Err(anyhow!("send_control: {e}"))
+                Err(Error::RendererControlFailed(format!("send_control: {e}")))
             }
         }
     }
@@ -728,12 +843,12 @@ impl RendererManager {
     pub async fn send_negotiate_buffers(
         &self,
         id: &str,
-        scheme: crate::negotiate::NegotiatedScheme,
+        scheme: crate::dma::negotiate::NegotiatedScheme,
     ) -> Result<()> {
         let handle = self
             .get(id)
             .await
-            .ok_or_else(|| anyhow!("unknown renderer: {id}"))?;
+            .ok_or_else(|| Error::RendererNotFound(id.to_string()))?;
         // Idempotence: skip if we've already dispatched this exact scheme.
         if let Ok(guard) = handle.last_dispatched_scheme.lock() {
             if guard.as_ref() == Some(&scheme) {
@@ -743,11 +858,16 @@ impl RendererManager {
         log::info!(
             "renderer {id}: NegotiateBuffers fourcc=0x{:08x} modifier=0x{:x} \
              plane_count={} sync=0x{:x} color=0x{:x} mem_hint=0x{:x} \
-             extent={}x{} count={} path={:?} mem_source={:?}",
-            scheme.fourcc, scheme.modifier, scheme.plane_count,
-            scheme.sync_mode, scheme.color, scheme.mem_hint,
-            scheme.extent.0, scheme.extent.1, scheme.count,
-            scheme.path, scheme.mem_source,
+             count={} path={:?} mem_source={:?}",
+            scheme.fourcc,
+            scheme.modifier,
+            scheme.plane_count,
+            scheme.sync_mode,
+            scheme.color,
+            scheme.mem_hint,
+            scheme.count,
+            scheme.path,
+            scheme.mem_source,
         );
         let msg = ControlMsg::NegotiateBuffers {
             fourcc: scheme.fourcc,
@@ -756,8 +876,6 @@ impl RendererManager {
             sync_mode: scheme.sync_mode,
             color: scheme.color,
             mem_hint: scheme.mem_hint,
-            extent_w: scheme.extent.0,
-            extent_h: scheme.extent.1,
             count: scheme.count,
             path: scheme.path.as_u32(),
             mem_source: scheme.mem_source.as_u32(),
@@ -767,6 +885,147 @@ impl RendererManager {
             *guard = Some(scheme);
         }
         Ok(())
+    }
+
+    /// Push a `setting_changed` event to a live renderer. `settings` is
+    /// the delta the caller already filtered to runtime-only keys
+    /// (identity-tagged settings would force respawn, not hot-reload).
+    /// `fps == None` is the no-fps-change signal; `Some(0)` is treated
+    /// as "no change" too — the wire format uses 0 as the unset
+    /// sentinel and a fps of 0 makes no physical sense for a renderer.
+    ///
+    /// On success the renderer's `runtime_settings` cache is merged
+    /// with `settings` so the next reuse comparison sees the post-apply
+    /// state. No idempotence cache for now; each call sends.
+    pub async fn send_setting_changed(
+        &self,
+        id: &str,
+        settings: Vec<(String, String)>,
+        fps: Option<u32>,
+    ) -> Result<()> {
+        let handle = self
+            .get(id)
+            .await
+            .ok_or_else(|| Error::RendererNotFound(id.to_string()))?;
+        // setting_changed is a pure kv list. fps is just one of the kv
+        // keys (when the manifest declares it), not a typed scalar.
+        // Fold the legacy `fps_change` arg into the kv list before
+        // dispatch.
+        let mut settings = settings;
+        if let Some(f) = fps {
+            if f != 0 {
+                settings.retain(|(k, _)| k != "fps");
+                settings.push(("fps".to_string(), f.to_string()));
+            }
+        }
+        let msg = ControlMsg::SettingChanged {
+            settings: settings.clone(),
+        };
+        log::info!(
+            "renderer {id}: setting_changed keys={:?}",
+            settings.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        );
+        self.send_control(id, msg).await?;
+        let _ = handle;
+        Ok(())
+    }
+
+    /// Forward a pointer-motion event to a live renderer. Silently
+    /// drops when the renderer's manifest didn't declare
+    /// `events = ["pointer"]` — this is the expected gating point for
+    /// any inbound pointer family event.
+    pub async fn send_pointer_motion(
+        &self,
+        id: &str,
+        x: f32,
+        y: f32,
+        timestamp_us: u64,
+        modifiers: u32,
+    ) -> Result<()> {
+        if !self.subscribed_to(id, "pointer").await {
+            return Ok(());
+        }
+        self.send_control(
+            id,
+            ControlMsg::PointerMotion {
+                x,
+                y,
+                timestamp_us,
+                modifiers,
+            },
+        )
+        .await
+    }
+
+    /// Forward a pointer-button event. Same gating as
+    /// [`Self::send_pointer_motion`].
+    pub async fn send_pointer_button(
+        &self,
+        id: &str,
+        x: f32,
+        y: f32,
+        button: u32,
+        state: u32,
+        timestamp_us: u64,
+        modifiers: u32,
+    ) -> Result<()> {
+        if !self.subscribed_to(id, "pointer").await {
+            return Ok(());
+        }
+        self.send_control(
+            id,
+            ControlMsg::PointerButton {
+                x,
+                y,
+                button,
+                state,
+                timestamp_us,
+                modifiers,
+            },
+        )
+        .await
+    }
+
+    /// Forward a pointer-axis (scroll) event. Same gating as
+    /// [`Self::send_pointer_motion`].
+    pub async fn send_pointer_axis(
+        &self,
+        id: &str,
+        x: f32,
+        y: f32,
+        delta_x: f32,
+        delta_y: f32,
+        source: u32,
+        timestamp_us: u64,
+        modifiers: u32,
+    ) -> Result<()> {
+        if !self.subscribed_to(id, "pointer").await {
+            return Ok(());
+        }
+        self.send_control(
+            id,
+            ControlMsg::PointerAxis {
+                x,
+                y,
+                delta_x,
+                delta_y,
+                source,
+                timestamp_us,
+                modifiers,
+            },
+        )
+        .await
+    }
+
+    /// Returns `true` when the renderer is alive and its manifest
+    /// declared `events = [..., kind, ...]`. Unknown id ⇒ `false`
+    /// (caller treats that as "drop on floor"; it's the same handling
+    /// `send_*` use for unsubscribed renderers).
+    async fn subscribed_to(&self, id: &str, kind: &str) -> bool {
+        match self.get(id).await {
+            Some(h) => h.events_subscribed.iter().any(|e| e == kind),
+            None => false,
+        }
     }
 
     /// Enqueue a renderer for eviction. Synchronous (cheap channel
@@ -808,7 +1067,7 @@ impl RendererManager {
             let mut inner = self.inner.lock().await;
             inner.renderers.remove(id)
         }
-        .ok_or_else(|| anyhow!("unknown renderer: {id}"))?;
+        .ok_or_else(|| Error::RendererNotFound(id.to_string()))?;
 
         // Try a polite shutdown first. Ignore the result — we're going
         // to SIGKILL it anyway.
@@ -842,14 +1101,17 @@ fn run_reader(
     bind_snapshot: Arc<StdMutex<Option<BindSnapshot>>>,
     sync_fds: Arc<StdMutex<std::collections::VecDeque<(u64, OwnedFd)>>>,
     release_syncobj: Arc<StdMutex<Option<OwnedFd>>>,
-    format_caps: Arc<StdMutex<Option<crate::negotiate::PeerCaps>>>,
+    format_caps: Arc<StdMutex<Option<crate::dma::negotiate::PeerCaps>>>,
     pending_configure: Arc<StdMutex<Option<u32>>>,
     reap_tx: tokio::sync::mpsc::UnboundedSender<RendererId>,
 ) {
     // Any exit path from this thread — clean EOF, recvmsg error, or
     // panic — enqueues the renderer for eviction so stale ids don't
     // leak out through find_reusable or bind_snapshot.
-    let _reap = ReaperOnDrop { id: id.clone(), tx: reap_tx };
+    let _reap = ReaperOnDrop {
+        id: id.clone(),
+        tx: reap_tx,
+    };
 
     // Hold the stream by dup'ing the raw fd so the blocking recv is not
     // contending with sends on the same mutex. recvmsg on an AF_UNIX
@@ -913,7 +1175,10 @@ fn run_reader(
                     "renderer {id}: BindBuffers length mismatch \
                      count={count} planes={planes_per_buffer} expected={expected} \
                      stride={} offset={} size={} fds={}; dropping",
-                    stride.len(), plane_offset.len(), size.len(), fds.len()
+                    stride.len(),
+                    plane_offset.len(),
+                    size.len(),
+                    fds.len()
                 );
             } else if fds.is_empty() {
                 log::warn!("renderer {id}: BindBuffers arrived without fds");
@@ -1007,7 +1272,6 @@ fn run_reader(
             ref fourccs,
             ref mod_counts,
             ref modifiers,
-            ref usages,
             ref plane_counts,
             ref device_uuid,
             ref driver_uuid,
@@ -1024,11 +1288,10 @@ fn run_reader(
                 major: drm_render_major,
                 minor: drm_render_minor,
             };
-            match crate::negotiate::unflatten_caps(
+            match crate::dma::negotiate::unflatten_caps(
                 fourccs,
                 mod_counts,
                 modifiers,
-                usages,
                 plane_counts,
                 device_uuid,
                 driver_uuid,
@@ -1050,7 +1313,11 @@ fn run_reader(
                         log::info!(
                             "{prefix}: imported {} fourcc{}",
                             caps.formats.by_fourcc.len(),
-                            if caps.formats.by_fourcc.len() == 1 { "" } else { "s" },
+                            if caps.formats.by_fourcc.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            },
                         );
                         caps.log_dump(&prefix);
                         *guard = Some(caps);
@@ -1074,9 +1341,7 @@ fn run_reader(
                  modifier=0x{modifier:x} reason={reason} msg={message:?}"
             );
         } else if !fds.is_empty() {
-            log::warn!(
-                "renderer {id}: unexpected fds on event {msg:?}, dropping"
-            );
+            log::warn!("renderer {id}: unexpected fds on event {msg:?}, dropping");
         }
 
         // Broadcast to any subscribers. No subscribers means no error:
@@ -1133,6 +1398,87 @@ impl Drop for TempUnlink {
     }
 }
 
+/// Build the typed `Init` control message the daemon emits right
+/// after a renderer subprocess connects back.
+///
+/// SPAWN_VERSION 3: Init carries only what's needed before
+/// `advertise_caps` (extent triple) plus the resolved settings kv.
+/// Resource path + extras (assets, workshop_id, …) ride on the
+/// renderer's CLI argv instead — see `spawn`'s argv builder.
+///
+/// `req.settings` is taken as authoritative — bound-checking and
+/// default-filling happen at the settings-store boundary
+/// (`Settings::reconcile` on startup, `coerce_and_validate` in the
+/// `SettingsSet` RPC), so spawn-time re-validation would be
+/// redundant defense. The typed `test_pattern` flag is injected
+/// last and overrides whatever was in `settings`, matching the
+/// apply-path contract where it is the canonical source for that
+/// key. `fps` is plain settings — callers put it in `req.settings`.
+///
+/// `spawn_version` is read from the manifest if set, otherwise the
+/// daemon's compile-time `SPAWN_VERSION` constant.
+pub(crate) fn build_init_msg(req: &SpawnRequest, def: &RendererDef) -> ControlMsg {
+    let spawn_version = def.spawn_version.unwrap_or(SPAWN_VERSION);
+
+    let mut settings_kv: HashMap<String, String> = req.settings.clone();
+
+    if def.settings.contains_key("test_pattern") && req.test_pattern {
+        settings_kv.insert("test_pattern".to_string(), "1".to_string());
+    }
+
+    let mut settings: Vec<(String, String)> = settings_kv.into_iter().collect();
+    settings.sort_by(|a, b| a.0.cmp(&b.0));
+
+    ControlMsg::Init {
+        spawn_version,
+        extent_w: req.width,
+        extent_h: req.height,
+        extent_mode: req.extent_mode,
+        settings,
+    }
+}
+
+/// Run the post-accept handshake on a blocking std `UnixStream`:
+/// send the typed `Init` request, then read exactly one event. On
+/// `Ready` return the renderer's `DrmNode`; on `InitNack` surface a
+/// readable error; any other event is treated as a protocol violation
+/// (caller is expected to kill the child).
+///
+/// Factored out of `RendererManager::spawn` so unit tests can drive
+/// it directly over a `UnixStream::pair()` without booting a child
+/// process.
+pub(crate) fn run_init_handshake(sock: &StdUnixStream, init: &ControlMsg) -> Result<DrmNode> {
+    send_control(sock, init, &[])
+        .map_err(|e| Error::RendererSpawnFailed(format!("send Init: {e}")))?;
+    let (evt, fds) =
+        recv_event(sock).map_err(|e| Error::RendererSpawnFailed(format!("recv Ready: {e}")))?;
+    match evt {
+        EventMsg::Ready {
+            drm_render_major,
+            drm_render_minor,
+        } => {
+            if !fds.is_empty() {
+                log::warn!("Ready unexpectedly carried {} fds; dropping", fds.len());
+            }
+            Ok(DrmNode {
+                major: drm_render_major,
+                minor: drm_render_minor,
+            })
+        }
+        EventMsg::InitNack {
+            received_spawn_version,
+            supported_spawn_version,
+            reason,
+        } => Err(Error::RendererSpawnFailed(format!(
+            "renderer rejected Init: {reason} (received spawn_version={received_spawn_version}, \
+             supported={supported_spawn_version})"
+        ))),
+        other => Err(Error::RendererSpawnFailed(format!(
+            "host emitted {other:?} before Ready; aborting spawn"
+        ))),
+    }
+}
+
 #[allow(dead_code)]
 fn _assert_path_ok<P: AsRef<std::path::Path>>(_p: P) {} // compile-time shim
 
@@ -1145,7 +1491,7 @@ impl RendererHandle {
     /// Test-only: inject a `PeerCaps` so router-level negotiation
     /// tests can pretend the renderer shipped a `FormatCaps` event.
     /// Replaces whatever was there.
-    pub fn test_set_format_caps(&self, caps: crate::negotiate::PeerCaps) {
+    pub fn test_set_format_caps(&self, caps: crate::dma::negotiate::PeerCaps) {
         if let Ok(mut g) = self.format_caps.lock() {
             *g = Some(caps);
         }
@@ -1161,10 +1507,13 @@ impl RendererHandle {
             .and_then(|g| g.as_ref().map(|c| c.blacklist.len()))
             .unwrap_or(0)
     }
+}
 
+impl RendererHandle {
     /// Construct a `RendererHandle` with no running child process.
-    /// Useful for routing-table tests that need a handle to register
-    /// against the router but never push frames through it.
+    /// Used by routing-table unit tests AND by the runtime self_test
+    /// (`waywallen --test`) which drives a stub renderer through the
+    /// production endpoint via [`Self::push_self_test_event`] etc.
     pub fn test_stub(id: &str, wp_type: &str) -> Arc<Self> {
         let (a, _b) = StdUnixStream::pair().expect("UnixStream pair");
         let (events_tx, _) = broadcast::channel::<EventMsg>(8);
@@ -1173,8 +1522,8 @@ impl RendererHandle {
             wp_type: wp_type.into(),
             width: 1920,
             height: 1080,
-            fps: 30,
-            metadata: HashMap::new(),
+            extent_mode: 0,
+            extras: HashMap::new(),
             name: "test-stub".into(),
             pid: None,
             gpu: DrmNode::UNKNOWN,
@@ -1188,17 +1537,378 @@ impl RendererHandle {
             frame_record_tx: None,
             pending_configure: Arc::new(StdMutex::new(None)),
             child: Arc::new(TokioMutex::new(None)),
+            events_subscribed: Arc::new(Vec::new()),
         })
+    }
+
+    /// self_test (runtime `--test`): broadcast an event as if the
+    /// renderer subprocess had emitted it. The router task subscribed
+    /// in `register_renderer` picks it up and runs the same hooks
+    /// (`on_renderer_bind` / `on_renderer_frame`) it would for a real
+    /// renderer.
+    pub fn push_self_test_event(&self, ev: EventMsg) {
+        let _ = self.events.send(ev);
+    }
+
+    /// self_test (runtime `--test`): stash a per-frame acquire sync_fd
+    /// the way the manager's reader thread does for production
+    /// renderers. The display endpoint dups one out of the deque on
+    /// each `forward_frame_ready` via [`clone_sync_fd`].
+    pub fn push_self_test_sync_fd(&self, seq: u64, fd: OwnedFd) {
+        if let Ok(mut g) = self.sync_fds.lock() {
+            g.push_back((seq, fd));
+            while g.len() > SYNC_FD_RETENTION {
+                g.pop_front();
+            }
+        }
+    }
+}
+
+impl RendererManager {
+    /// Insert a pre-built handle into the manager's map without
+    /// spawning a child process. Used by routing-table unit tests
+    /// AND the runtime self_test (`waywallen --test`).
+    pub async fn register_test_handle(&self, handle: Arc<RendererHandle>) {
+        let mut inner = self.inner.lock().await;
+        inner.renderers.insert(handle.id.clone(), handle);
     }
 }
 
 #[cfg(test)]
-impl RendererManager {
-    /// Insert a pre-built handle into the manager's map without
-    /// spawning a child process. Pair with `RendererHandle::test_stub`
-    /// for unit tests of the router/reaper logic.
-    pub async fn register_test_handle(&self, handle: Arc<RendererHandle>) {
-        let mut inner = self.inner.lock().await;
-        inner.renderers.insert(handle.id.clone(), handle);
+mod init_handshake_tests {
+    use super::*;
+    use crate::ipc::uds::send_event;
+    use crate::plugin::renderer_registry::{SettingDef, SettingType};
+    use std::path::PathBuf;
+    use std::thread;
+
+    fn def_legacy(name: &str) -> RendererDef {
+        // Legacy (no-schema) manifest: build_init_msg falls back to
+        // the hard-coded primary-key priority list.
+        RendererDef {
+            name: name.to_string(),
+            bin: PathBuf::from("/dev/null"),
+            types: vec!["scene".to_string()],
+            priority: 100,
+            version: "v0.0.0".into(),
+            spawn_version: None,
+            extras: Vec::new(),
+            settings: Default::default(),
+            events: Vec::new(),
+        }
+    }
+
+    fn def_scene_schema() -> RendererDef {
+        RendererDef {
+            name: "wescene-renderer".into(),
+            bin: PathBuf::from("/dev/null"),
+            types: vec!["scene".into()],
+            priority: 100,
+            version: "v0.0.0".into(),
+            spawn_version: Some(1),
+            extras: vec!["assets".into(), "workshop_id".into()],
+            settings: Default::default(),
+            events: Vec::new(),
+        }
+    }
+
+    fn def_mpv_schema() -> RendererDef {
+        let mut ps = HashMap::new();
+        ps.insert(
+            "loop_file".to_string(),
+            SettingDef::new(
+                SettingType::String,
+                toml::Value::String("inf".into()),
+                false,
+            ),
+        );
+        RendererDef {
+            name: "waywallen-mpv".into(),
+            bin: PathBuf::from("/dev/null"),
+            types: vec!["video".into()],
+            priority: 100,
+            version: "v0.0.0".into(),
+            spawn_version: Some(1),
+            extras: Vec::new(),
+            settings: ps,
+            events: Vec::new(),
+        }
+    }
+
+    // Legacy build_init_msg tests (resource_primary / resource_extras /
+    // typed fps) were removed when the wire shape was slimmed down for
+    // SPAWN_VERSION 3. Phase 6 will add a fresh test pass for the new
+    // shape (extent + settings kv only) once `resolve_active_settings`
+    // lands.
+
+    #[test]
+    fn slim_init_carries_extent_and_settings_kv() {
+        // SPAWN_VERSION 3 sanity: extent triple + settings kv come
+        // through verbatim. The caller is responsible for sourcing a
+        // reconciled settings map (the daemon pulls it from
+        // `Settings::plugin(&name)`); build_init_msg does not refill
+        // defaults or filter unknown keys.
+        let mut settings_in = HashMap::new();
+        settings_in.insert("loop_file".to_string(), "inf".to_string());
+        let req = SpawnRequest {
+            extras: HashMap::new(),
+            wp_type: "video".into(),
+            settings: settings_in,
+            width: 1920,
+            height: 1080,
+            extent_mode: 0,
+            test_pattern: false,
+            renderer_name: None,
+        };
+        let msg = build_init_msg(&req, &def_mpv_schema());
+        match msg {
+            ControlMsg::Init {
+                spawn_version,
+                extent_w,
+                extent_h,
+                extent_mode,
+                settings,
+            } => {
+                assert_eq!(spawn_version, 1); // pulled from def_mpv_schema
+                assert_eq!(extent_w, 1920);
+                assert_eq!(extent_h, 1080);
+                assert_eq!(extent_mode, 0);
+                assert_eq!(settings, vec![("loop_file".to_string(), "inf".to_string())]);
+            }
+            other => panic!("expected ControlMsg::Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_handshake_init_nack_aborts() {
+        // Daemon side ↔ renderer side over a socketpair: we drive
+        // `run_init_handshake` from the daemon side and have a tiny
+        // peer thread reply with an InitNack on the renderer side.
+        let (daemon, renderer) = StdUnixStream::pair().expect("UnixStream::pair");
+        daemon
+            .set_nonblocking(false)
+            .expect("set_nonblocking(false) on daemon side");
+        renderer
+            .set_nonblocking(false)
+            .expect("set_nonblocking(false) on renderer side");
+
+        let peer = thread::spawn(move || {
+            // Receive the Init then immediately reply with InitNack.
+            let (got, _fds) = crate::ipc::uds::recv_control(&renderer).expect("renderer recv Init");
+            assert!(matches!(got, ControlMsg::Init { .. }));
+            send_event(
+                &renderer,
+                &EventMsg::InitNack {
+                    received_spawn_version: 999,
+                    supported_spawn_version: SPAWN_VERSION,
+                    reason: "unsupported spawn_version".into(),
+                },
+                &[],
+            )
+            .expect("renderer send InitNack");
+        });
+
+        let mut settings = HashMap::new();
+        settings.insert("scene".to_string(), "/tmp/scene.pkg".to_string());
+        let req = SpawnRequest {
+            extras: HashMap::new(),
+            wp_type: "scene".into(),
+            settings,
+            width: 800,
+            height: 600,
+            extent_mode: 0,
+            test_pattern: false,
+            renderer_name: None,
+        };
+        let init = build_init_msg(&req, &def_legacy("wescene-renderer"));
+        let err =
+            run_init_handshake(&daemon, &init).expect_err("InitNack must abort the handshake");
+        let s = err.to_string();
+        assert!(
+            s.contains("renderer rejected Init"),
+            "unexpected error: {s}"
+        );
+        assert!(
+            s.contains("unsupported spawn_version"),
+            "unexpected error: {s}"
+        );
+
+        peer.join().expect("peer thread");
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+    use crate::plugin::renderer_registry::{
+        RendererDef, RendererRegistry, SettingDef, SettingType,
+    };
+    use std::path::PathBuf;
+
+    fn def_mpv() -> RendererDef {
+        let mut ps = HashMap::new();
+        ps.insert(
+            "loop_file".to_string(),
+            SettingDef::new(
+                SettingType::String,
+                toml::Value::String("inf".into()),
+                false,
+            ),
+        );
+        ps.insert(
+            "hwdec".to_string(),
+            SettingDef::new(
+                SettingType::String,
+                toml::Value::String("auto".into()),
+                false,
+            ),
+        );
+        RendererDef {
+            name: "waywallen-mpv".into(),
+            bin: PathBuf::from("/dev/null"),
+            types: vec!["video".into()],
+            priority: 100,
+            version: "v0.0.0".into(),
+            spawn_version: Some(1),
+            extras: Vec::new(),
+            settings: ps,
+            events: Vec::new(),
+        }
+    }
+
+    /// Construct a live mpv handle stub with the given extras dict.
+    /// Mirrors `RendererHandle::test_stub` but lets the test pin
+    /// `extras` (the per-spawn identity differentiator).
+    fn live_mpv_handle(id: &str, extras: HashMap<String, String>) -> Arc<RendererHandle> {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (events_tx, _) = tokio::sync::broadcast::channel::<EventMsg>(8);
+        Arc::new(RendererHandle {
+            id: id.into(),
+            wp_type: "video".into(),
+            width: 1920,
+            height: 1080,
+            extent_mode: 0,
+            extras,
+            name: "waywallen-mpv".into(),
+            pid: None,
+            gpu: DrmNode::UNKNOWN,
+            sock: Arc::new(StdMutex::new(a)),
+            events: events_tx,
+            bind_snapshot: Arc::new(StdMutex::new(None)),
+            sync_fds: Arc::new(StdMutex::new(std::collections::VecDeque::new())),
+            release_syncobj: Arc::new(StdMutex::new(None)),
+            format_caps: Arc::new(StdMutex::new(None)),
+            last_dispatched_scheme: Arc::new(StdMutex::new(None)),
+            frame_record_tx: None,
+            pending_configure: Arc::new(StdMutex::new(None)),
+            child: Arc::new(TokioMutex::new(None)),
+            events_subscribed: Arc::new(Vec::new()),
+        })
+    }
+
+    fn req_with_extras(extras: HashMap<String, String>) -> SpawnRequest {
+        SpawnRequest {
+            extras,
+            wp_type: "video".into(),
+            settings: HashMap::new(),
+            width: 1920,
+            height: 1080,
+            extent_mode: 0,
+            test_pattern: false,
+            renderer_name: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn find_reusable_hits_when_extras_match() {
+        let mut registry = RendererRegistry::new();
+        registry.register(def_mpv());
+        let mgr = RendererManager::new(registry);
+
+        let mut extras = HashMap::new();
+        extras.insert("path".into(), "/clip.mp4".into());
+        let h = live_mpv_handle("h1", extras.clone());
+        mgr.register_test_handle(h).await;
+
+        let req = req_with_extras(extras);
+        let id = mgr.find_reusable(&req).await.expect("reuse hit expected");
+        assert_eq!(id, "h1");
+    }
+
+    #[tokio::test]
+    async fn find_reusable_misses_on_different_path() {
+        let mut registry = RendererRegistry::new();
+        registry.register(def_mpv());
+        let mgr = RendererManager::new(registry);
+
+        let mut h_extras = HashMap::new();
+        h_extras.insert("path".into(), "/clip.mp4".into());
+        mgr.register_test_handle(live_mpv_handle("h1", h_extras))
+            .await;
+
+        let mut req_extras = HashMap::new();
+        req_extras.insert("path".into(), "/other.mp4".into());
+        let req = req_with_extras(req_extras);
+        assert!(
+            mgr.find_reusable(&req).await.is_none(),
+            "different path must miss reuse",
+        );
+    }
+
+    #[tokio::test]
+    async fn send_setting_changed_writes_wire_and_updates_cache() {
+        // Direct end-to-end: spawn a socketpair, plug one side into a
+        // RendererHandle's sock, call send_setting_changed, drain the
+        // wire on the other side, assert the kv arrived.
+        let mut registry = RendererRegistry::new();
+        registry.register(def_mpv());
+        let mgr = RendererManager::new(registry);
+
+        let (daemon_side, renderer_side) = std::os::unix::net::UnixStream::pair().unwrap();
+        daemon_side.set_nonblocking(false).unwrap();
+        renderer_side.set_nonblocking(false).unwrap();
+
+        let (events_tx, _) = tokio::sync::broadcast::channel::<EventMsg>(8);
+        let h = Arc::new(RendererHandle {
+            id: "h1".into(),
+            wp_type: "video".into(),
+            width: 1920,
+            height: 1080,
+            extent_mode: 0,
+            extras: HashMap::new(),
+            name: "waywallen-mpv".into(),
+            pid: None,
+            gpu: DrmNode::UNKNOWN,
+            sock: Arc::new(StdMutex::new(daemon_side)),
+            events: events_tx,
+            bind_snapshot: Arc::new(StdMutex::new(None)),
+            sync_fds: Arc::new(StdMutex::new(std::collections::VecDeque::new())),
+            release_syncobj: Arc::new(StdMutex::new(None)),
+            format_caps: Arc::new(StdMutex::new(None)),
+            last_dispatched_scheme: Arc::new(StdMutex::new(None)),
+            frame_record_tx: None,
+            pending_configure: Arc::new(StdMutex::new(None)),
+            child: Arc::new(TokioMutex::new(None)),
+            events_subscribed: Arc::new(Vec::new()),
+        });
+        mgr.register_test_handle(Arc::clone(&h)).await;
+
+        // Renderer-side reader running in a thread to drain the wire.
+        let peer = std::thread::spawn(move || {
+            let (req, _fds) = crate::ipc::uds::recv_control(&renderer_side).expect("recv");
+            req
+        });
+
+        mgr.send_setting_changed("h1", vec![("loop_file".into(), "no".into())], None)
+            .await
+            .expect("send_setting_changed ok");
+
+        let got = peer.join().expect("peer joined");
+        match got {
+            ControlMsg::SettingChanged { settings } => {
+                assert_eq!(settings, vec![("loop_file".into(), "no".into())]);
+            }
+            other => panic!("expected ApplySettings, got {other:?}"),
+        }
     }
 }

@@ -1,0 +1,48 @@
+# waywallen build environment (conda-forge only).
+# Usage:
+#   first time:  conda env create -f environment.yml
+#   update:      conda env update -n waywallen -f environment.yml --prune
+# Normally invoked automatically by ./scripts/build_appimage.sh.
+name: waywallen
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  # Qt6 >= 6.10 (UI uses Quick / DBus / Protobuf; Wayland platform plugin is a separate package)
+  - qt6-main>=6.10
+  - qt6-wayland>=6.10
+  - freetype
+
+  # Used to build qtgrpc from source (conda-forge has no Qt6 Protobuf package)
+  - libprotobuf
+  - protobuf
+
+  # Toolchain: clang / clang++ / lld all 22.x (BUILD.md requires >=22)
+  # clang-tools provides clang-scan-deps (required by C++20 module compilation)
+  # The _linux-64 packages are activation wrappers — they pull in the sysroot
+  # and arrange for CC/CXX to use a clang wrapper that injects --sysroot.
+  # sysroot_linux-64=2.28 -> manylinux_2_28 baseline, covers most active distros.
+  - clang=22
+  - clangxx=22
+  - clang-tools=22
+  - lld=22
+  - clang_linux-64=22
+  - clangxx_linux-64=22
+  - sysroot_linux-64=2.28
+
+  # bundled into the AppImage by linuxdeploy.
+  - libvulkan-headers
+  - libvulkan-loader
+  - mesa-libgbm-devel-conda-x86_64
+  - lz4-c
+
+  # FFmpeg is built from source by scripts/build_ffmpeg.sh — it gives us a
+  # known-minimal codec set and the same sysroot baseline as the rest of the
+  # tree. nasm is needed for the asm optimizations; make for ffmpeg's build.
+  - nasm
+  - make
+
+  # Build infrastructure
+  - cmake>=3.28
+  - ninja
+  - pkg-config

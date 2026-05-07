@@ -29,7 +29,7 @@ Renderer::Renderer(const proto::RendererInstance& info, QObject* parent)
       m_pid(info.pid()) {}
 
 void Renderer::updateFrom(const proto::RendererInstance& info) {
-    assert(info.rendererId() == m_id, "Renderer::updateFrom id mismatch");
+    rstd_assert(info.rendererId() == m_id, "Renderer::updateFrom id mismatch");
 
     if (m_fps != info.fps()) {
         m_fps = info.fps();
@@ -83,7 +83,7 @@ auto RendererManager::get(const QString& id) const -> Renderer* {
 }
 
 void RendererManager::replaceAll(const QList<proto::RendererInstance>& list) {
-    cppstd::map<QString, Renderer*> next_by_id;
+    std::map<QString, Renderer*> next_by_id;
     QList<Renderer*>                next_ordered;
     next_ordered.reserve(list.size());
 
